@@ -1,0 +1,61 @@
+name: audora2
+description: Audora 2.0 —— 个人自用音乐播放器（元数据来自 QQ音乐，音源来自 B站）
+publish_to: 'none'
+version: 2.0.0+1
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+  flutter: '>=3.24.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  # 状态管理（可替换为 Riverpod）
+  provider: ^6.1.2
+
+  # 本地数据库（歌曲 / 收藏 / 音源映射）
+  sqflite: ^2.3.3
+  path: ^1.9.0
+  path_provider: ^2.1.4
+
+  # 轻量设置持久化（音质偏好等），与数据库分开——
+  # 这些是「本机偏好」不是曲库数据，不该混进 audora.db 影响备份/清理
+  shared_preferences: ^2.3.2
+
+  # 网络（QQ音乐元数据 + B站音源）
+  dio: ^5.7.0
+
+  # Wbi 签名所需的 MD5
+  crypto: ^3.0.6
+
+  # 音频播放（Media3 / ExoPlayer 后端）
+  just_audio: ^0.10.6
+
+  # 后台播放 + 通知栏 / 锁屏媒体控制（MediaSession）
+  audio_service: ^0.18.19
+  permission_handler: ^13.0.2
+  qr_flutter: ^4.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  # 真机集成测试（integration_test/live_smoke_test.dart，需要真机 + 网络）
+  integration_test:
+    sdk: flutter
+  # 单测里用 sqlite3 的内存库跑 DAO（真机走 sqflite 原生实现，不用这个包）
+  sqflite_common_ffi: ^2.4.3
+hooks:
+  user_defines:
+    sqlite3:
+      source: system
+      name:
+        # Windows 的系统 SQLite 叫 winsqlite3.dll（位于 System32）
+        windows: winsqlite3
+        # Android / 其他平台用默认名（libsqlite3.so）
+        default: sqlite3
+
+flutter:
+  uses-material-design: true

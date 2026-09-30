@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  资源收缩白名单（Resource Shrinking keep 规则）。
+
+  ## 为什么必须保留 audio_service_* 图标
+  Flutter 3.22+ 的 Gradle 插件对 release 构建**默认开启** R8 混淆 +
+  资源收缩（FlutterPlugin.kt: isMinifyEnabled=true, isShrinkResources=true）。
+  audio_service 通知栏 / 锁屏 / 线控的按钮图标（audio_service_play_arrow /
+  audio_service_pause / audio_service_skip_next / audio_service_skip_previous /
+  audio_service_stop / audio_service_fast_forward / audio_service_fast_rewind）
+  只在 Dart 侧以字符串引用（MediaControl.androidIcon），运行时经
+  `Resources.getIdentifier()` 解析——资源收缩器静态分析看不到这种引用，
+  会把它们全部裁掉。图标缺失后 iconId=0，Android 13+ 上
+  `PlaybackStateCompat.CustomAction.Builder` 直接抛
+  "You must specify an icon resource id to build a CustomAction"，
+  整条通知构建失败 → 通知栏媒体卡片不出现、前台 Service 无通知，
+  Flyme 等激进 ROM 会把这种「无前台服务的后台播放」静音/查杀
+  （真机魅族 21 实测：后台播放与通知栏控制双双失效的同一根因）。
+-->
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@drawable/audio_service_*" />

@@ -1,0 +1,100 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 网络权限：QQ音乐元数据 + B站音源 -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+
+    <!-- 后台播放 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+
+    <!-- 通知（Android 13+ 需运行时申请） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+    <application
+        android:label="Audora"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true">
+
+        <!--
+          ⚠️ 这里**必须**是 audio_service 提供的 AudioServiceActivity，不能用自己
+          继承 FlutterActivity 的 MainActivity（那样会「初始化失败」白屏）。
+
+          原因：audio_service 在 Android 上要与宿主 UI 共用同一个 FlutterEngine，
+          它把引擎缓存在 FlutterEngineCache 里（id = "audio_service_engine"）。
+          AudioServiceActivity 的代码只有一件事：
+            provideFlutterEngine(context) = AudioServicePlugin.getFlutterEngine(context)
+          —— 把那个共享引擎交给 FlutterActivity 用于渲染。
+          普通 FlutterActivity 不重写这个方法，于是 AudioService.init() 拿不到引擎，
+          抛 PlatformException(The Activity class ... has not provided the correct FlutterEngine)。
+
+          注意：**不要**写一个继承 AudioServiceActivity 的 Kotlin 空子类再在这里引用它。
+          实测（魅族 21 / Android 16）那样做会「引擎 warm up 但 View 永远不 attach」——
+          表现为停在启动图/白屏，logcat 只有 `flutterEngine warmed up` 而没有
+          `Displayed`。直接用插件自己的类最稳。
+        -->
+        <activity
+            android:name="com.ryanheise.audioservice.AudioServiceActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize"
+            tools:ignore="Instantiatable">
+
+            <meta-data
+                android:name="io.flutter.embedding.android.NormalTheme"
+                android:resource="@style/NormalTheme"/>
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2"/>
+
+        <!--
+          audio_service：后台播放的承载者。
+
+          AudioService 是一个前台 Service，通知栏 / 锁屏的媒体卡片由它维护。
+          没有这段声明时，audio_service 会在启动时抛
+            "You need to declare the service in AndroidManifest.xml"
+          它必须声明 `android:foregroundServiceType="mediaPlayback"`，
+          否则 Android 14+ 会拒绝启动前台服务（MissingForegroundServiceTypeException）。
+
+          MediaButtonReceiver 负责接有线耳机 / 蓝牙耳机的播放暂停键。
+        -->
+        <service
+            android:name="com.ryanheise.audioservice.AudioService"
+            android:foregroundServiceType="mediaPlayback"
+            android:exported="true"
+            tools:ignore="Instantiatable">
+            <intent-filter>
+                <action android:name="android.media.browse.MediaBrowserService"/>
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name="com.ryanheise.audioservice.MediaButtonReceiver"
+            android:exported="true"
+            tools:ignore="Instantiatable">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON"/>
+            </intent-filter>
+        </receiver>
+    </application>
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+    </queries>
+</manifest>
