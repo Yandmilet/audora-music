@@ -38,6 +38,9 @@ dependencies:
   permission_handler: ^13.0.2
   qr_flutter: ^4.1.0
 
+  # 图片磁盘缓存（歌单封面 / 歌手头像 / 封面墙）
+  cached_network_image: ^4.0.4
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

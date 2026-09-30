@@ -1,3 +1,4 @@
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart' as ja;
 
@@ -129,7 +130,12 @@ class _PlayerScreenState extends State<PlayerScreen>
                 ],
               ),
             ),
-            _ProgressBar(st: st),
+            // 进度条订阅**秒级进度通道**：只重建这一小块，
+            // 不陪着整棵树走（见 [AppState.posTick]）。
+            ValueListenableBuilder<int>(
+              valueListenable: st.posTick,
+              builder: (_, __, ___) => _ProgressBar(st: st),
+            ),
             _Controls(st: st),
             _FootActions(st: st),
             SizedBox(height: MediaQuery.of(context).padding.bottom + 8),
@@ -339,15 +345,14 @@ class _VinylCover extends StatelessWidget {
           CoverArt(seed: song.coverSeed, size: size, radius: size / 2),
           if (url != null)
             ClipOval(
-              child: Image.network(
-                url,
+              child: CachedNetworkImage(
+                imageUrl: url,
                 fit: BoxFit.cover,
-                // 失败画透明，露出底层渐变（不在 errorBuilder 里重复画）
-                errorBuilder: (_, __, ___) => const SizedBox.shrink(),
-                // 加载中同样露出渐变，完成后再淡入图片（progress == null
-                // 表示加载完成，此时才放行真正的图片帧）
-                loadingBuilder: (context, child, progress) =>
-                    progress == null ? child : const SizedBox.shrink(),
+                // 失败画透明，露出底层渐变（不在 errorWidget 里重复画）
+                errorWidget: (_, __, ___) => const SizedBox.shrink(),
+                // 加载中画透明露出渐变，下载完成后淡入图片；
+                // 默认 fadeInDuration 500ms 已能柔化从占位到图片的切换。
+                placeholder: (_, __) => const SizedBox.shrink(),
               ),
             ),
         ],
@@ -551,11 +556,17 @@ class _LyricTabState extends State<_LyricTab> {
   void initState() {
     super.initState();
     widget.st.addListener(_onState);
+    // 滚动跟随的第二路驱动：**秒级进度通道**。
+    // 位置推进不再触发 AppState 的全局通知（见 [AppState.posTick]），
+    // 少了这一行就会「高亮在变、列表不滚」——而且只在播放中暴露，
+    // 静止调试看不出来。
+    widget.st.posTick.addListener(_onState);
   }
 
   @override
   void dispose() {
     widget.st.removeListener(_onState);
+    widget.st.posTick.removeListener(_onState);
     _scroll.dispose();
     super.dispose();
   }
@@ -624,7 +635,12 @@ class _LyricTabState extends State<_LyricTab> {
               if (lines.isEmpty) {
                 return _EmptyLyric(t: t, instrumental: st.lyric.instrumental);
               }
-              return _buildList(t, st, lines);
+              // 当前行高亮同样跟着秒级进度走，且**只重建歌词列表**：
+              // 歌词有几十到上百行，跟着整棵树一起重建是这里最贵的开销。
+              return ValueListenableBuilder<int>(
+                valueListenable: st.posTick,
+                builder: (_, __, ___) => _buildList(t, st, lines),
+              );
             },
           ),
         ),

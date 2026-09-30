@@ -419,10 +419,57 @@ class AppState extends ChangeNotifier {
   List<Song> _queue = const [];
   int _index = -1;
   bool _playing = false;
-  int _position = 0;
   int _duration = 0;
+
+  /// 播放位置（秒）的私有真值。**只能经由 [_position] 的 setter 写**，
+  /// 这样才能保证每一次写入都同步发布到 [posTick]。
+  int _positionRaw = 0;
+
+  /// 当前播放位置（秒）。
+  ///
+  /// 做成 getter/setter 而不是裸字段，是为了让「写位置」与「发进度通知」
+  /// 成为**同一个动作**：类内原有 11 处 `_position = x`（切歌归零、恢复
+  /// 续播、seek、位置流推送…）不必逐个改，也不可能漏掉某一处导致
+  /// 进度条停在上一首的数值。
+  int get _position => _positionRaw;
+
+  set _position(int v) {
+    if (_positionRaw == v) return;
+    _positionRaw = v;
+    // ValueNotifier 自带等值去重：同一秒内的多次写入只会通知一次。
+    posTick.value = v;
+  }
+
+  /// 播放进度的**高频通知通道**（秒粒度）。
+  ///
+  /// ## 为什么不复用 [notifyListeners]（这是一处性能修复，别退回去）
+  /// [notifyListeners] 最主要的订阅方是 `main.dart` 根部那个包住整个
+  /// `MaterialApp` 的 `AnimatedBuilder`——它一响就是**整棵树重建**：
+  /// `MaterialApp → Shell → IndexedStack → HomeScreen → TabBarView → 4 个目录 tab`。
+  ///
+  /// 而 `positionStream` 在播放中每秒推送多次（just_audio 约 200ms 一次）。
+  /// 也就是说：**只要在放歌，整棵树每秒要重建好几次**。叠加刚改完的歌手库
+  /// （100 行列表 + 每行网络头像）之后，真机表现就是用户反馈的
+  /// 「UI 切换卡顿迟滞」——切 tab、滑列表都在跟进度重建抢帧
+  /// （2026-09-30 定位并实测）。
+  ///
+  /// 进度本身是**纯局部状态**，消费方只有三处：
+  ///   1. 播放页 `_ProgressBar`（时间文本 + 进度条 + 拖拽把手）
+  ///   2. 播放页歌词列表（当前行高亮 + 自动滚动跟随）
+  ///   3. 迷你播放条底部细进度条（Shell 内嵌条 / 次级页悬浮条）
+  /// 让这三处各自 `ValueListenableBuilder` 订阅本通道，重建成本从
+  /// 「整棵树」降到「几个小部件」。
+  ///
+  /// 曲目切换、播放/暂停、歌词文本替换等**低频**事件仍旧走
+  /// [notifyListeners]，语义没有变化——本通道只管「秒数在走」。
+  final ValueNotifier<int> posTick = ValueNotifier<int>(0);
+
   PlayMode _mode = PlayMode.sequential;
   Timer? _ticker;
+
+  /// 全局随机源：next(shuffle) / shufflePlay 共用一个实例，避免每次 new
+  /// Random() 的轻量开销；next 还会主动排除当前 index，防止随机到同一首。
+  final Random _rng = Random();
 
   // ---- 播放统计 ----
   //
@@ -953,8 +1000,6 @@ class AppState extends ChangeNotifier {
   ///
   /// 3s 而非更早版本的 5s：轻提示是单行短文案（10~20 字），5s 驻留过长
   /// （2026-09-30 用户反馈）。带错误详情的长文案走播放页 SnackBar。
-  Future<void> showToastLater(String msg) async => showToast(msg);
-
   void showToast(String msg) {
     _toast = msg;
     notifyListeners();
@@ -1127,7 +1172,11 @@ class AppState extends ChangeNotifier {
       if (_resumeSeekSec == null && (_position - _lastPersistedPos).abs() >= 15) {
         unawaited(persistSession());
       }
-      notifyListeners();
+      // ⚠️ 这里**故意不调 notifyListeners()**：位置在走是高频道事件，
+      // 走全局通知会让整棵树每秒重建数次。进度相关的三处 UI 订阅
+      // [posTick]（`_position` 的 setter 已随写随发），见该字段的说明。
+      // 必须由本通道通知的低频事件（切歌 / 播放状态 / 歌词文本）在各自
+      // 的代码路径上单独 notifyListeners()，与本行无关。
     });
 
     _durSub = p.durationStream.listen((d) {
@@ -1258,9 +1307,13 @@ class AppState extends ChangeNotifier {
     _ticker?.cancel();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (_position < _duration) {
+        // `_position++` 走 setter，已同步发布 [posTick]。
         _position++;
         _updateLyricLine();
-        notifyListeners();
+        // ⚠️ 这里**不要**加回 notifyListeners()。模拟计时器与真实播放器的
+        // 位置流必须是同一口径（推进 = 只发秒级通道），否则测试里就再也
+        // 复现不出「播放中整棵树被反复重建」这个真实缺陷——
+        // 无播放器时恰好是测试唯一能驱动时间前进的路径。
       } else {
         next();
       }
@@ -1277,7 +1330,14 @@ class AppState extends ChangeNotifier {
       return;
     }
     if (_mode == PlayMode.shuffle) {
-      _index = Random().nextInt(_queue.length);
+      // 排除当前 index：随机播不应原地重播（除非队列只有 1 首）
+      if (_queue.length == 1) {
+        _index = 0;
+      } else {
+        var pick = _rng.nextInt(_queue.length - 1);
+        if (pick >= _index) pick++;
+        _index = pick;
+      }
     } else {
       _index = (_index + 1) % _queue.length;
     }
@@ -1524,7 +1584,7 @@ class AppState extends ChangeNotifier {
         final activated = await repo.activateBestCandidate(id);
         if (!activated) return null;
         // 告知用户这是自动挑选的版本，不满意可以去人工换
-        unawaited(showToastLater('已自动选择最相似的音源，可在播放页「手动更换音源」调整'));
+        unawaited(Future.microtask(() => showToast('已自动选择最相似的音源，可在播放页「手动更换音源」调整')));
       }
 
       // 必须重新读库：matchOne 只写数据库，不会改内存里的对象。
@@ -1637,7 +1697,8 @@ class AppState extends ChangeNotifier {
 
   void _setResolving(bool v) {
     if (_resolving == v) return;
-    _resolving = v;    notifyListeners();
+    _resolving = v;
+    notifyListeners();
   }
 
   /// 从某个上下文列表点歌播放。
@@ -1658,8 +1719,13 @@ class AppState extends ChangeNotifier {
   void playSong(Song song, {List<Song>? source}) {
     final q = source ?? _library;
     final i = q.indexWhere((s) => s.key == song.key);
+    if (i < 0) {
+      // source / _library 里没有这首歌（例如已被删除或在线歌单未入库）
+      // —— 静默 fallback 到 index 0 会播错歌，直接 return。
+      return;
+    }
     _queue = [...q];
-    _index = i >= 0 ? i : 0;
+    _index = i;
     _position = 0;
     _lyricLine = 0;
     _resumeSeekSec = null;
@@ -1717,7 +1783,7 @@ class AppState extends ChangeNotifier {
       ..._library.take(15),
     }.toList();
     if (pool.isEmpty) return;
-    playQueue(pool, Random().nextInt(pool.length));
+    playQueue(pool, _rng.nextInt(pool.length));
   }
 
   /// 切换收藏。
@@ -1992,6 +2058,7 @@ class AppState extends ChangeNotifier {
     _posSub?.cancel();
     _durSub?.cancel();
     _playSub?.cancel();
+    posTick.dispose();
     // 注意：_player 不在这里 dispose。
     // 它由 main.dart 创建并持有，生命周期比 AppState 长
     // （系统回收界面后前台 Service 仍需继续播放）。

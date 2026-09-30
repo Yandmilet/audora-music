@@ -7,6 +7,7 @@
 /// 由全局状态条给出进度反馈。
 library;
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
 import '../data/repository/library_repository.dart';
@@ -231,12 +232,12 @@ class _CoverOrArt extends StatelessWidget {
     }
     return ClipRRect(
       borderRadius: BorderRadius.circular(Tokens.rMd),
-      child: Image.network(
-        url!,
+      child: CachedNetworkImage(
+        imageUrl: url!,
         width: size,
         height: size,
         fit: BoxFit.cover,
-        errorBuilder: (_, __, ___) =>
+        errorWidget: (_, __, ___) =>
             CoverArt(seed: seed, size: size, radius: 0),
       ),
     );

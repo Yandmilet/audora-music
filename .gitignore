@@ -51,6 +51,11 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
+# Release signing material —— 绝对禁止入库（口令与私钥明文）
+/android/app/key.properties
+*.keystore
+*.jks
+
 # Widget Preview related
 .widget_preview/
 

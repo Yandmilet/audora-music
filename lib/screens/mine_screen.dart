@@ -1,3 +1,4 @@
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
 import '../models/models.dart';
@@ -563,18 +564,14 @@ class _BiliAvatar extends StatelessWidget {
       child: SizedBox(
         width: 58,
         height: 58,
-        child: Image.network(
-          faceUrl,
+        child: CachedNetworkImage(
+          imageUrl: faceUrl,
           fit: BoxFit.cover,
           // 加载中先给一个不刺眼的底色，避免透明闪烁
-          frameBuilder: (c, child, frame, wasSync) => frame == null
-              ? child
-              : Container(
-                  color: const Color(0xFFF1F3F7),
-                  alignment: Alignment.center,
-                  child: child,
-                ),
-          errorBuilder: (c, e, st) => fallback,
+          placeholder: (_, __) => Container(
+            color: const Color(0xFFF1F3F7),
+          ),
+          errorWidget: (_, __, ___) => fallback,
         ),
       ),
     );

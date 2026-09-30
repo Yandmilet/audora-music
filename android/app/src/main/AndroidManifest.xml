@@ -17,7 +17,9 @@
         android:label="Audora"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
-        android:usesCleartextTraffic="true">
+        android:allowBackup="false"
+        android:usesCleartextTraffic="false"
+        android:networkSecurityConfig="@xml/network_security_config">
 
         <!--
           ⚠️ 这里**必须**是 audio_service 提供的 AudioServiceActivity，不能用自己

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  网络安全配置：默认拒绝所有明文 HTTP 请求。
+  Audora 全量接口（QQ 音乐 / B站 / 头像 CDN / 封面图）均走 HTTPS，
+  代码里还有 http → https 主动升级兜底（app_state.dart + qqmusic_catalog_dto.dart）。
+
+  未来若需临时放行某个 HTTP 域名（例如内网调试 / 老 CDN），
+  在 <domain-config cleartextTrafficPermitted="true"> 下加 <domain> 即可。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system"/>
+        </trust-anchors>
+    </base-config>
+</network-security-config>

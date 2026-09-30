@@ -7,7 +7,7 @@
 ![Flutter](https://img.shields.io/badge/Flutter-3.47-02569B?logo=flutter)
 ![Platform](https://img.shields.io/badge/Platform-Android%207.0%2B-3DDC84?logo=android)
 ![License](https://img.shields.io/badge/License-MIT-blue)
-![Tests](https://img.shields.io/badge/tests-204%2F204_passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-356%2F356_passing-brightgreen)
 
 ---
 
