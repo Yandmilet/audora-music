@@ -232,19 +232,25 @@ class AudioPlayerController extends BaseAudioHandler with SeekHandler {
 
       // 自动重匹配换了音源：通知栏与当前歌对象都要跟上，
       // 否则「正在播 A 的视频、界面显示 B」——很难查的错位。
-      if (res.rematched && res.bvid != song.source?.bvid) {
+      // 步骤 7：用通用字段比较（sourceKey），不再硬编码 bvid
+      if (res.rematched && res.sourceKey != (song.source?.sourceKey ?? song.source?.bvid)) {
         _current = song.copyWith(
-          source: song.source?.copyWith(bvid: res.bvid, cid: res.cid),
+          source: song.source?.copyWith(
+            bvid: res.sourceKey,
+            cid: int.tryParse(res.sourceSubKey) ?? 0,
+            sourceKey: res.sourceKey,
+            sourceSubKey: res.sourceSubKey,
+          ),
         );
         mediaItem.add(_toMediaItem(_current!));
       }
 
-      // ★ 关键：B站 CDN 校验 Referer，不带就 403
-      // 用完整前缀写 just_audio 的 AudioSource，与领域模型的 AudioSource 区分
+      // ★ 关键：CDN 拉流可能需要请求头（B站要 Referer）
+      // 从 resolver.sourceHeaders 读，不再硬编码 bilibili.com
       await _player.setAudioSource(
         ja.AudioSource.uri(
           Uri.parse(res.url!),
-          headers: SourceResolver.audioHeaders,
+          headers: r.sourceHeaders,
         ),
       );
       // 装载成功：从这一刻起播放器「有源」，play() 的空态守卫放行

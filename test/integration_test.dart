@@ -15,7 +15,9 @@ import 'package:audora2/services/bilibili/bili_dto.dart';
 import 'package:audora2/services/match/match_config.dart';
 import 'package:audora2/services/match/match_engine.dart';
 import 'package:audora2/services/match/match_scorer.dart';
+import 'package:audora2/services/metadata/qqmusic_metadata_adapter.dart';
 import 'package:audora2/services/qqmusic/qqmusic_provider.dart';
+import 'package:audora2/services/source/bili_audio_source_adapter.dart';
 import 'package:audora2/state/app_state.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -46,8 +48,8 @@ void main() {
     final client = BiliApiClient();
     repo = LibraryRepository(
       db: db,
-      engine: MatchEngine(BiliApi(client)),
-      qq: QQMusicProvider(),
+      engine: MatchEngine(BiliAudioSourceAdapter(BiliApi(client))),
+      metadata: QQMusicMetadataAdapter(QQMusicProvider()),
     );
   });
 

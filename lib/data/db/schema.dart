@@ -23,21 +23,28 @@ class Tables {
 /// ── 表 1：Song（设计文档 3.1）────────────────────────────────
 const String kCreateSongTable = '''
 CREATE TABLE ${Tables.song} (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  qq_song_mid   TEXT    NOT NULL UNIQUE,
-  title         TEXT    NOT NULL,
-  artists       TEXT    NOT NULL,
-  album         TEXT    NOT NULL DEFAULT '',
-  album_mid     TEXT    NOT NULL DEFAULT '',
-  lyricist      TEXT,
-  composer      TEXT,
-  arranger      TEXT,
-  genre         TEXT,
-  release_date  INTEGER,
-  duration_ms   INTEGER NOT NULL DEFAULT 0,
-  cover_seed    INTEGER NOT NULL DEFAULT 0,
-  created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  qq_song_mid       TEXT    NOT NULL,
+  meta_source_type  TEXT    NOT NULL DEFAULT 'qq',
+  meta_source_id    TEXT    NOT NULL DEFAULT '',
+  title             TEXT    NOT NULL,
+  artists           TEXT    NOT NULL,
+  album             TEXT    NOT NULL DEFAULT '',
+  album_mid         TEXT    NOT NULL DEFAULT '',
+  singer_mid        TEXT    NOT NULL DEFAULT '',
+  singer_id         INTEGER,
+  lyricist          TEXT,
+  composer          TEXT,
+  arranger          TEXT,
+  genre             TEXT,
+  release_date      INTEGER,
+  duration_ms       INTEGER NOT NULL DEFAULT 0,
+  cover_seed        INTEGER NOT NULL DEFAULT 0,
+  lyric_offset_ms   INTEGER NOT NULL DEFAULT 0,
+  created_at        INTEGER NOT NULL,
+  updated_at        INTEGER NOT NULL,
+  UNIQUE (qq_song_mid),
+  UNIQUE (meta_source_type, meta_source_id)
 );
 ''';
 
@@ -49,6 +56,9 @@ const String kCreateVideoTable = '''
 CREATE TABLE ${Tables.video} (
   bvid                  TEXT    PRIMARY KEY,
   cid                   INTEGER NOT NULL,
+  source_type           TEXT    NOT NULL DEFAULT 'bilibili',
+  source_key            TEXT    NOT NULL DEFAULT '',
+  source_sub_key        TEXT    NOT NULL DEFAULT '',
   title                 TEXT    NOT NULL,
   author                TEXT    NOT NULL DEFAULT '',
   mid                   INTEGER NOT NULL DEFAULT 0,
@@ -78,6 +88,8 @@ CREATE TABLE ${Tables.binding} (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   song_id       INTEGER NOT NULL,
   bvid          TEXT    NOT NULL,
+  source_type   TEXT    NOT NULL DEFAULT 'bilibili',
+  source_key    TEXT    NOT NULL DEFAULT '',
   is_active     INTEGER NOT NULL DEFAULT 0,
   match_score   REAL    NOT NULL DEFAULT 0,
   confidence    TEXT    NOT NULL DEFAULT 'REVIEW',
@@ -169,6 +181,44 @@ CREATE TABLE ${Tables.trackVolume} (
 );
 ''';
 
+/// v4 → v5：通用化列，支持多种元数据源/音源
+///
+/// ## 为什么先加列 + 双写，不直接删旧列
+/// - **无损**：用户已有曲库行一夜之间多了套通用列，但旧列照常读写
+/// - **可滚**：新列出问题时可以继续按旧列跑，不阻塞业务
+/// - **步骤 7 再接**：等领域模型也有了 sourceType/sourceKey，就可以逐步让
+///   新写入只走通用列；旧列直到确认没人用了（步骤 8）再删
+///
+/// 迁移脚本：每个表只加列 + 回填，不删不重建。
+const List<String> kMigrateV4ToV5 = [
+  // Song 表：元数据源通用化
+  "ALTER TABLE ${Tables.song} ADD COLUMN meta_source_type TEXT NOT NULL DEFAULT 'qq';",
+  "ALTER TABLE ${Tables.song} ADD COLUMN meta_source_id   TEXT NOT NULL DEFAULT '';",
+  "UPDATE ${Tables.song} SET meta_source_type = 'qq', meta_source_id = qq_song_mid;",
+
+  // Video 表：音源通用化
+  "ALTER TABLE ${Tables.video} ADD COLUMN source_type    TEXT NOT NULL DEFAULT 'bilibili';",
+  "ALTER TABLE ${Tables.video} ADD COLUMN source_key     TEXT NOT NULL DEFAULT '';",
+  "ALTER TABLE ${Tables.video} ADD COLUMN source_sub_key TEXT NOT NULL DEFAULT '';",
+  "UPDATE ${Tables.video} SET source_type = 'bilibili', source_key = bvid, source_sub_key = CAST(cid AS TEXT);",
+
+  // Binding 表：音源通用化（song_source_binding 重命名为 source_binding，
+  // 但 SQLite 不支持 ALTER TABLE RENAME，且改表名牵连 DAO SQL，
+  // 所以这里**暂不改表名**，只加通用列。步骤 7 接领域模型后再评估要不要迁移表名）
+  "ALTER TABLE ${Tables.binding} ADD COLUMN source_type TEXT NOT NULL DEFAULT 'bilibili';",
+  "ALTER TABLE ${Tables.binding} ADD COLUMN source_key  TEXT NOT NULL DEFAULT '';",
+  "UPDATE ${Tables.binding} SET source_type = 'bilibili', source_key = bvid;",
+
+  // Song 表建表语句也要更新（新安装直接带通用列）
+  // ⚠️ SQLite 不支持 ALTER TABLE 加 UNIQUE，所以建表时把 (qq_song_mid) 改成
+  // (meta_source_type, meta_source_id) 双列 UNIQUE —— 但旧库已经有 UNIQUE(qq_song_mid)
+  // 了，ALTER TABLE 加列不能改约束，所以旧库保持 (qq_song_mid) 唯一，
+  // 新库用 (meta_source_type, meta_source_id) 唯一。两者效果等价：
+  //   - 旧库：qq_song_mid 对 QQ 歌唯一，meta_source_type/meta_source_id 只是冗余副本
+  //   - 新库：(meta_source_type, meta_source_id) 对任何源唯一
+  // 步骤 8 统一后两套约束会合并。
+];
+
 /// 索引：按「找某首歌的激活音源」「找待匹配的歌」「找失效音源」三种查询建
 const List<String> kCreateIndexes = [
   'CREATE INDEX idx_binding_song_active ON ${Tables.binding}(song_id, is_active);',
@@ -200,7 +250,12 @@ const List<String> kCreateAll = [
 /// v1 → v2：新增 `liked_song` 表（收藏持久化）
 /// v2 → v3：新增 `play_log` / `play_stat` 表（播放历史与次数统计）
 /// v3 → v4：新增 `track_volume` 表（每曲音量记忆，音效功能 P0）
-const int kDbVersion = 4;
+/// v4 → v5：新增通用化列（meta_source_type/id、source_type/key/sub_key），
+///          支持多种元数据源/音源；旧列照常读写（双写模式）
+/// v5 → v6：Song 表新增 `singer_mid` 列（首位歌手 mid，播放页点击进歌手详情）
+/// v6 → v7：Song 表新增 `singer_id` 列（首位歌手数字 ID，fetchSingerAlbums 必需）
+/// v7 → v8：Song 表新增 `lyric_offset_ms` 列（歌词手动校准偏移，方案 D 歌词对齐）
+const int kDbVersion = 8;
 
 /// 迁移脚本：v1 → v2
 ///
@@ -222,6 +277,29 @@ const List<String> kMigrateV2ToV3 = [
 /// 迁移脚本：v3 → v4（只加表，不动既有数据）
 const List<String> kMigrateV3ToV4 = [
   kCreateTrackVolumeTable,
+];
+
+/// 迁移脚本：v5 → v6（加 singer_mid 列）
+///
+/// 只加列，不动既有数据。旧数据 singer_mid 默认空字符串。
+/// 下次播放时若从目录类入口点歌（persistOnline 带 singerMid），
+/// 会覆盖 upsert 把新列填上。
+const List<String> kMigrateV5ToV6 = [
+  'ALTER TABLE ${Tables.song} ADD COLUMN singer_mid TEXT NOT NULL DEFAULT \'\';',
+];
+
+/// 迁移脚本：v6 → v7（加 singer_id 列）
+///
+/// singer_id 是 fetchSingerAlbums 的必需数字 ID，空值时 SingerDetailScreen 降级。
+const List<String> kMigrateV6ToV7 = [
+  'ALTER TABLE ${Tables.song} ADD COLUMN singer_id INTEGER;',
+];
+
+/// 迁移脚本：v7 → v8（加 lyric_offset_ms 列）
+///
+/// 歌词手动校准偏移（毫秒）。默认 0 = 不偏移，由用户在播放页歌词面板微调后写入。
+const List<String> kMigrateV7ToV8 = [
+  'ALTER TABLE ${Tables.song} ADD COLUMN lyric_offset_ms INTEGER NOT NULL DEFAULT 0;',
 ];
 
 const String kDbName = 'audora.db';

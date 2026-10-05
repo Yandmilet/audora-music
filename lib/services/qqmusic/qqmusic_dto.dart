@@ -2,6 +2,19 @@
 library;
 
 import '../../models/models.dart';
+import 'qqmusic_catalog_dto.dart';
+
+// 批量解析 DTO 与 MetadataProvider 接口**共用同一套定义**。
+//
+// ## 为什么是 re-export 而不是各自一份
+// 之前 BatchQuery / BatchRejection / ResolvedEntry / BatchResolveResult
+// 在这里和 metadata_provider.dart 各有一份**逐字段相同**的拷贝，
+// 适配器里被迫手写字段映射（Dart 无 structural typing），
+// 调用方还会拿到两个同名不同类型、互相赋不了值的 BatchQuery。
+// 现在只保留 metadata_provider.dart 一份权威定义，
+// 本文件的老 import 路径继续可用（QQMusicProvider / 测试不用改 import）。
+export '../metadata/metadata_provider.dart'
+    show BatchQuery, BatchRejection, BatchResolveResult, ResolvedEntry;
 
 /// QQ音乐搜索结果 / 详情结果的统一中间表示。
 ///
@@ -15,8 +28,21 @@ class QQSongMeta {
   final List<String> artists;
   final String album;
 
-  /// 专辑 mid，用于拼封面 URL
+  /// 专辑 mid，用于拼封面 URL + 专辑详情跳转
   final String albumMid;
+
+  /// 首位歌手的字符串 mid（进入歌手详情页必需）。
+  ///
+  /// 目录类接口（musicu.fcg）的 singer 数组每个元素带 `mid` 字段；
+  /// 搜索接口可能不带，此时为空字符串。取首位主唱即可——
+  /// 多歌手场景下「进谁的详情」本身就是歧义的，选第一个是最合理的默认。
+  final String singerMid;
+
+  /// 首位歌手的数字 ID（fetchSingerAlbums 必需）。
+  ///
+  /// singer 数组每个元素通常带 `id`（int）。部分来源（mock/搜索老接口）
+  /// 可能没有这个字段，此时为 null，SingerDetailScreen 会降级。
+  final int? singerId;
 
   /// 时长（秒）
   final int interval;
@@ -33,6 +59,8 @@ class QQSongMeta {
     required this.artists,
     this.album = '',
     this.albumMid = '',
+    this.singerMid = '',
+    this.singerId,
     this.interval = 0,
     this.releaseDate,
     this.subtitle = '',
@@ -45,12 +73,18 @@ class QQSongMeta {
   ///   interval(秒) / pubtime(秒级时间戳)
   factory QQSongMeta.fromSearchJson(Map<String, dynamic> json) {
     final singers = <String>[];
+    var firstSingerMid = '';
+    int? firstSingerId;
     final rawSinger = json['singer'];
     if (rawSinger is List) {
       for (final s in rawSinger) {
         if (s is Map) {
           final name = s['name']?.toString() ?? '';
           if (name.isNotEmpty) singers.add(name);
+          if (firstSingerMid.isEmpty) {
+            firstSingerMid = s['mid']?.toString() ?? '';
+          }
+          firstSingerId ??= (s['id'] as num?)?.toInt();
         }
       }
     }
@@ -61,6 +95,8 @@ class QQSongMeta {
       artists: singers,
       album: _clean(json['albumname']?.toString() ?? ''),
       albumMid: json['albummid']?.toString() ?? '',
+      singerMid: firstSingerMid,
+      singerId: firstSingerId,
       interval: _toInt(json['interval']),
       releaseDate: _parseUnixSeconds(json['pubtime']),
       subtitle: json['lyric']?.toString() ?? '',
@@ -86,12 +122,19 @@ class QQSongMeta {
   /// 见 `ToplistPreviewRow` 的注释。
   factory QQSongMeta.fromCatalogJson(Map<String, dynamic> j) {
     final artists = <String>[];
+    var firstSingerMid = '';
+    int? firstSingerId;
     final rawSinger = j['singer'];
     if (rawSinger is List) {
       for (final s in rawSinger) {
         if (s is Map) {
           final name = s['name']?.toString() ?? '';
           if (name.isNotEmpty) artists.add(name);
+          // 目录接口 singer 数组每个元素带 mid + id 字段（实测 musicu.fcg 返回）
+          if (firstSingerMid.isEmpty) {
+            firstSingerMid = s['mid']?.toString() ?? '';
+          }
+          firstSingerId ??= (s['id'] as num?)?.toInt();
         }
       }
     }
@@ -118,6 +161,8 @@ class QQSongMeta {
       artists: artists,
       album: _clean(albumName),
       albumMid: albumMid,
+      singerMid: firstSingerMid,
+      singerId: firstSingerId,
       interval: _toInt(j['interval']),
       // 新版给 "YYYY-MM-DD"，老版给秒级 pubtime，两者都要能认
       releaseDate: _parseDateString(j['time_public']?.toString()) ??
@@ -133,12 +178,18 @@ class QQSongMeta {
   ///   interval(秒) / time_public("YYYY-MM-DD") / subtitle
   QQSongMeta mergeDetail(Map<String, dynamic> ti) {
     final singers = <String>[];
+    var newSingerMid = '';
+    int? newSingerId;
     final rawSinger = ti['singer'];
     if (rawSinger is List) {
       for (final s in rawSinger) {
         if (s is Map) {
           final name = s['name']?.toString() ?? '';
           if (name.isNotEmpty) singers.add(name);
+          if (newSingerMid.isEmpty) {
+            newSingerMid = s['mid']?.toString() ?? '';
+          }
+          newSingerId ??= (s['id'] as num?)?.toInt();
         }
       }
     }
@@ -155,6 +206,8 @@ class QQSongMeta {
       artists: singers.isNotEmpty ? singers : artists,
       album: albumName.isNotEmpty ? albumName : album,
       albumMid: albumMidNew.isNotEmpty ? albumMidNew : albumMid,
+      singerMid: newSingerMid.isNotEmpty ? newSingerMid : singerMid,
+      singerId: newSingerId ?? singerId,
       interval: _toInt(ti['interval']) > 0 ? _toInt(ti['interval']) : interval,
       releaseDate: _parseDateString(ti['time_public']?.toString()) ??
           releaseDate,
@@ -182,6 +235,7 @@ class QQSongMeta {
       // 设计文档 3.1：多歌手用 / 分隔，**保留原始顺序**（首位是主唱，影响匹配权重）
       artist: artists.join('/'),
       album: album,
+      albumMid: albumMid.isEmpty ? null : albumMid,
       duration: interval,
       lyricist: _nullIfEmpty(credits?.lyricist),
       composer: _nullIfEmpty(credits?.composer),
@@ -191,6 +245,8 @@ class QQSongMeta {
       sourceStatus: SourceStatus.none,
       coverSeed: coverSeed,
       coverUrl: coverUrl,
+      singerMid: singerMid.isEmpty ? null : singerMid,
+      singerId: singerId,
     );
   }
 
@@ -218,6 +274,133 @@ class QQSongMeta {
   }
 
   static String _clean(String s) => s.replaceAll(RegExp(r'\s+'), ' ').trim();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 综合搜索聚合结果（四分类）
+// ═══════════════════════════════════════════════════════════════
+//
+// QQ 音乐公开搜索接口 `search_for_qq_cp` **只返回歌曲**，没有独立的
+// 歌手 / 专辑 / 歌单搜索端点。但每条歌曲结果内嵌了完整的歌手信息
+// （singer[].{mid, name, id}）和专辑信息（albummid, albumname）。
+/// 因此歌手和专辑是**从歌曲结果中提取去重**得到的——语义上等同于
+/// 「搜到的所有歌曲里出现过哪些歌手 / 专辑」。
+
+/// 一次综合搜索的完整结果。
+///
+/// 四个分类各自独立：歌曲是接口直接返回的列表；歌手 / 专辑是
+/// 从歌曲结果中按 mid 去重提取的；歌单暂缺（无公开搜索接口）。
+class QQSearchResults {
+  /// 搜到的所有歌曲（完整的 QQSongMeta，含 mid / 封面等）
+  final List<QQSongMeta> songs;
+
+  /// 从歌曲中提取的唯一歌手（按出现次数降序，首位即关键词匹配度最高）
+  final List<SingerBrief> singers;
+
+  /// 从歌曲中提取的唯一专辑（同上）
+  final List<AlbumBrief> albums;
+
+  /// 歌单搜索结果——目前无公开接口，始终为空列表。
+  /// 留这个字段是为了 UI 层四 Tab 结构完整，将来有接口可直接接上。
+  final List<PlaylistBrief> playlists;
+
+  const QQSearchResults({
+    this.songs = const [],
+    this.singers = const [],
+    this.albums = const [],
+    this.playlists = const [],
+  });
+
+  bool get isEmpty =>
+      songs.isEmpty && singers.isEmpty && albums.isEmpty && playlists.isEmpty;
+  bool get isNotEmpty => !isEmpty;
+
+  int get songTotal => songs.length;
+  int get singerTotal => singers.length;
+  int get albumTotal => albums.length;
+  int get playlistTotal => playlists.length;
+
+  /// 从歌曲列表中提取唯一歌手和专辑，构建完整的聚合结果。
+  ///
+  /// ## 为什么按出现次数排序
+  /// 搜索"周杰伦"时，前 30 首里大部分都是周杰伦的歌，那周杰伦
+  /// 应该排在歌手列表的第一位（count=30）。出现次数越少说明
+  /// 匹配度越低（可能只是客串了一首歌），排在后面。
+  static QQSearchResults fromSongs(List<QQSongMeta> songs) {
+    // 歌手：按 mid 去重 + 统计出现次数
+    final singerCount = <String, int>{};
+    final singerMap = <String, SingerBrief>{};
+    for (final s in songs) {
+      // 每首歌的首位歌手是主唱，所有出现的歌手都要统计
+      for (var i = 0; i < s.artists.length; i++) {
+        final mid = s.singerMid;
+        if (mid.isEmpty) continue;
+        singerCount[mid] = (singerCount[mid] ?? 0) + 1;
+        if (!singerMap.containsKey(mid)) {
+          // 注意：singerMid 只存了首位主唱的 mid 和 id
+          // 非首位歌手没有独立 mid（搜索接口只给一个 singerMid），
+          // 所以 artist 数组可能有 2 个名字但只有 1 个 mid
+          singerMap[mid] = SingerBrief(
+            mid: mid,
+            singerId: s.singerId,
+            name: s.artists.isNotEmpty ? s.artists.first : '',
+            pic: QQSearchResults._singerPicUrl(mid),
+          );
+        }
+      }
+    }
+    final singers = singerMap.values.toList()
+      ..sort((a, b) {
+        final ca = singerCount[a.mid] ?? 0;
+        final cb = singerCount[b.mid] ?? 0;
+        return cb.compareTo(ca); // 次数多的排前面
+      });
+
+    // 专辑：按 albummid 去重
+    final albumCount = <String, int>{};
+    final albumMap = <String, AlbumBrief>{};
+    for (final s in songs) {
+      final mid = s.albumMid;
+      if (mid.isEmpty) continue;
+      albumCount[mid] = (albumCount[mid] ?? 0) + 1;
+      if (!albumMap.containsKey(mid)) {
+        albumMap[mid] = AlbumBrief(
+          mid: mid,
+          name: s.album,
+          cover: QQSongMeta.coverUrlFor(mid) ?? '',
+          singerName: s.artists.join('/'),
+          releaseDate: s.releaseDate != null
+              ? _formatDate(s.releaseDate!)
+              : '',
+        );
+      }
+    }
+    final albums = albumMap.values.toList()
+      ..sort((a, b) {
+        final ca = albumCount[a.mid] ?? 0;
+        final cb = albumCount[b.mid] ?? 0;
+        return cb.compareTo(ca);
+      });
+
+    return QQSearchResults(
+      songs: songs,
+      singers: singers,
+      albums: albums,
+      playlists: const [],
+    );
+  }
+
+  /// 歌手头像 URL（T001R300x300M000{mid}.jpg 用 https）
+  static String _singerPicUrl(String mid) =>
+      'https://y.gtimg.cn/music/photo_new/T001R300x300M000$mid.jpg';
+
+  /// DateTime → "YYYY-MM-DD"
+  static String _formatDate(DateTime dt) {
+    final y = dt.year.toString();
+    final m = dt.month.toString().padLeft(2, '0');
+    final d = dt.day.toString().padLeft(2, '0');
+    return '$y-$m-$d';
+  }
 }
 
 /// 创作者信息（从歌词头部解析）。
@@ -331,112 +514,4 @@ class QQLyric {
   const QQLyric({required this.lrc, this.trans, required this.credits});
 
   bool get hasTranslation => trans != null && trans!.trim().isNotEmpty;
-}
-
-/// 批量解析的单条输入：**标题 + 歌手 + 期望时长**三元组。
-///
-/// 严格模式必须知道期望时长，否则时长这一维失效、退化成二重校验。
-/// 用三元组而非裸关键词，是为了强制调用方把手上已有的信息交全 ——
-/// 曲库导入的原始素材（B站收藏夹 / 本地歌单）天然带时长。
-class BatchQuery {
-  final String title;
-  final String artist;
-
-  /// 期望时长（秒）。<=0 表示调用方确实没有时长信息（会跳过该维度）。
-  final int durationSec;
-
-  /// 调用方自带的标识（如 B站 bvid），便于把失败结果映射回原始条目。
-  final String refId;
-
-  const BatchQuery({
-    required this.title,
-    required this.artist,
-    this.durationSec = 0,
-    this.refId = '',
-  });
-
-  @override
-  String toString() => '$title - $artist'
-      '${durationSec > 0 ? ' (${durationSec}s)' : ''}';
-}
-
-/// 一条被淘汰的记录。批量导入最怕「30 首进去、24 首出来、不知道丢的是哪 6 首」。
-class BatchRejection {
-  final BatchQuery query;
-  final String reason;
-
-  const BatchRejection(this.query, this.reason);
-
-  @override
-  String toString() => '${query.refId.isNotEmpty ? '[${query.refId}] ' : ''}'
-      '$query → $reason';
-}
-
-/// 一条解析成功的记录。
-///
-/// ## 为什么必须带上 [songMid]
-/// 领域模型 [Song] **刻意不含存储字段**（见 `rows.dart` 的说明），
-/// 所以 QQ音乐的真实 `songMid` 在 `toSong()` 时被丢掉。入库时若只剩
-/// 标题 + 歌手，就只能派生 `local:title|artist` 兜底——而带 `local:`
-/// 前缀的 mid 在 `fetchLyric` 里会被直接判为「查不到」，歌词功能
-/// 静默失效（实测：真机歌词命中 0 首）。
-///
-/// 这里把 mid 与 Song 一起带回，让调用方能落真实 mid。
-class ResolvedEntry {
-  /// 输入 query（用于对齐诊断信息 / 取调用方自带的 refId）
-  final BatchQuery query;
-
-  /// 解析出的领域对象（不含存储字段）
-  final Song song;
-
-  /// QQ音乐真实 songMid（14 位十六进制）。**入库必须用它**。
-  final String songMid;
-
-  /// QQ音乐专辑 mid，用于拼封面 URL；可能为空。
-  final String albumMid;
-
-  const ResolvedEntry({
-    required this.query,
-    required this.song,
-    required this.songMid,
-    this.albumMid = '',
-  });
-
-  @override
-  String toString() => 'ResolvedEntry($songMid, ${song.title})';
-}
-
-/// 批量解析结果：成功的歌 + 被淘汰的详情。
-///
-/// ## 为什么 pairs 而不是两个平行 List
-/// `songs` 与输入的 `queries` **索引不对齐**——失败项被跳过了，
-/// `songs` 是紧凑的。调用方若天真地用 `queries[i]` 去取对应输入，
-/// 只要前面失败过一首，后面全部错位（这正是 `importFromKeywords`
-/// 第一版踩的坑）。这里用 (query, song) 配对，从类型上杜绝错位。
-///
-/// 另外中间没有 `songs` 与 `queries` 的平行 list 让人误用——只管 `successes`。
-class BatchResolveResult {
-  /// 成功项：输入 query / Song / 真实 songMid 三者配对
-  final List<ResolvedEntry> successes;
-
-  final List<BatchRejection> rejections;
-
-  const BatchResolveResult({
-    required this.successes,
-    required this.rejections,
-  });
-
-  List<Song> get songs => successes.map((e) => e.song).toList();
-
-  int get total => successes.length + rejections.length;
-  int get successCount => successes.length;
-  int get rejectedCount => rejections.length;
-
-  /// 成功率（0-1）。total 为 0 时返回 0，避免除零。
-  double get successRate => total == 0 ? 0 : successCount / total;
-
-  @override
-  String toString() =>
-      'BatchResolveResult($successCount/$total 成功, '
-      '${(successRate * 100).toStringAsFixed(0)}%)';
 }

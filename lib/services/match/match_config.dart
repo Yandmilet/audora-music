@@ -73,9 +73,24 @@ class MatchConfig {
 
   // ── Stage 2 硬过滤 ────────────────────────────────────────
 
-  /// 时长粗筛容忍（毫秒）。用绝对值判断，因为音乐视频常加片头/封面页，
-  /// 导致 B站时长**比歌曲略长**，单向条件会误杀。
-  static const int durationToleranceMs = 30 * 1000;
+  /// 时长粗筛的**绝对上限**（毫秒）。长歌可以给到 30 秒容忍，短歌收紧。
+  ///
+  /// ## 为什么短歌要收紧
+  /// 固定 30 秒对一首 2 分钟的歌（120s）意味着允许 25% 的波动 ——
+  /// 一首歌 vs 一个拼接/剪辑视频都能过，Stage 2 就失去了"硬过滤"的意义。
+  /// 动态公式 = `min(30s, 歌曲时长的 15%)`，这样短歌（如 2min）收紧到 18s，
+  /// 长歌（如 5min）保持 30s 上限不变。
+  static const int durationToleranceMaxMs = 30 * 1000;
+
+  /// 按歌曲时长反推动态粗筛容忍（毫秒）。
+  /// 实现见 [durationToleranceMaxMs] 的注释。
+  static int durationToleranceFor(int songMs) {
+    if (songMs <= 0) return durationToleranceMaxMs;
+    final dynamicTolerance = (songMs * 0.15).round();
+    return dynamicTolerance < durationToleranceMaxMs
+        ? dynamicTolerance
+        : durationToleranceMaxMs;
+  }
 
   /// 零播放 + 30 天内发布 → 多为废稿
   static const int zeroPlayAgeDays = 30;

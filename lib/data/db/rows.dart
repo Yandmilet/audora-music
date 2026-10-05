@@ -20,12 +20,23 @@ class SongRow {
   /// QQ音乐唯一标识。**domain 的 Song 里没有这个字段**——
   /// 它是纯存储概念。解析时由 provider 的 songMid 提供，
   /// 手动录入的歌则用 `title|artist` 的哈希兜底（保证 UNIQUE 不冲突）。
+  ///
+  /// ⚠️ 步骤 6 双写期：qq_song_mid 照常读写，meta_source_type/meta_source_id
+  /// 是它的冗余副本（QQ 歌两者值相同）。步骤 7 领域模型接上后逐步让新写入只走通用列。
   final String qqSongMid;
+
+  /// 通用元数据源类型 —— 'qq' / 'netease' / ...（未来扩展）
+  final String metaSourceType;
+
+  /// 通用元数据源 ID —— 与 meta_source_type 配对，唯一标识一首歌
+  final String metaSourceId;
 
   final String title;
   final String artists;
   final String album;
   final String albumMid;
+  final String singerMid;
+  final int? singerId;
   final String? lyricist;
   final String? composer;
   final String? arranger;
@@ -33,16 +44,21 @@ class SongRow {
   final int? releaseDate;
   final int durationMs;
   final int coverSeed;
+  final int lyricOffsetMs;
   final int createdAt;
   final int updatedAt;
 
   const SongRow({
     this.id,
     required this.qqSongMid,
+    this.metaSourceType = 'qq',
+    this.metaSourceId = '',
     required this.title,
     required this.artists,
     this.album = '',
     this.albumMid = '',
+    this.singerMid = '',
+    this.singerId,
     this.lyricist,
     this.composer,
     this.arranger,
@@ -50,6 +66,7 @@ class SongRow {
     this.releaseDate,
     this.durationMs = 0,
     this.coverSeed = 0,
+    this.lyricOffsetMs = 0,
     required this.createdAt,
     required this.updatedAt,
   });
@@ -57,10 +74,16 @@ class SongRow {
   Map<String, Object?> toMap() => {
         if (id != null) 'id': id,
         'qq_song_mid': qqSongMid,
+        // 双写：新库用 (meta_source_type, meta_source_id) 唯一，
+        // 旧库只有 (qq_song_mid) 唯一，两套都写上保证旧库 UNIQUE 不冲突
+        'meta_source_type': metaSourceType,
+        'meta_source_id': metaSourceId.isEmpty ? qqSongMid : metaSourceId,
         'title': title,
         'artists': artists,
         'album': album,
         'album_mid': albumMid,
+        'singer_mid': singerMid,
+        'singer_id': singerId,
         'lyricist': lyricist,
         'composer': composer,
         'arranger': arranger,
@@ -68,47 +91,70 @@ class SongRow {
         'release_date': releaseDate,
         'duration_ms': durationMs,
         'cover_seed': coverSeed,
+        'lyric_offset_ms': lyricOffsetMs,
         'created_at': createdAt,
         'updated_at': updatedAt,
       };
 
-  factory SongRow.fromMap(Map<String, Object?> m) => SongRow(
-        id: m['id'] as int?,
-        qqSongMid: m['qq_song_mid'] as String? ?? '',
-        title: m['title'] as String? ?? '',
-        artists: m['artists'] as String? ?? '',
-        album: m['album'] as String? ?? '',
-        albumMid: m['album_mid'] as String? ?? '',
-        lyricist: m['lyricist'] as String?,
-        composer: m['composer'] as String?,
-        arranger: m['arranger'] as String?,
-        genre: m['genre'] as String?,
-        releaseDate: m['release_date'] as int?,
-        durationMs: m['duration_ms'] as int? ?? 0,
-        coverSeed: m['cover_seed'] as int? ?? 0,
-        createdAt: m['created_at'] as int? ?? 0,
-        updatedAt: m['updated_at'] as int? ?? 0,
-      );
+  factory SongRow.fromMap(Map<String, Object?> m) {
+    // 读通用列，为空时兜底从旧列派生（兼容 v4→v5 迁移前的老行）
+    final metaType = m['meta_source_type'] as String?;
+    final metaId = m['meta_source_id'] as String?;
+    final qqMid = m['qq_song_mid'] as String? ?? '';
+    return SongRow(
+      id: m['id'] as int?,
+      qqSongMid: qqMid,
+      metaSourceType: (metaType != null && metaType.isNotEmpty) ? metaType : 'qq',
+      metaSourceId: (metaId != null && metaId.isNotEmpty) ? metaId : qqMid,
+      title: m['title'] as String? ?? '',
+      artists: m['artists'] as String? ?? '',
+      album: m['album'] as String? ?? '',
+      albumMid: m['album_mid'] as String? ?? '',
+      singerMid: m['singer_mid'] as String? ?? '',
+      singerId: m['singer_id'] as int?,
+      lyricist: m['lyricist'] as String?,
+      composer: m['composer'] as String?,
+      arranger: m['arranger'] as String?,
+      genre: m['genre'] as String?,
+      releaseDate: m['release_date'] as int?,
+      durationMs: m['duration_ms'] as int? ?? 0,
+      coverSeed: m['cover_seed'] as int? ?? 0,
+      lyricOffsetMs: m['lyric_offset_ms'] as int? ?? 0,
+      createdAt: m['created_at'] as int? ?? 0,
+      updatedAt: m['updated_at'] as int? ?? 0,
+    );
+  }
 
   /// 领域 Song → 行。
   ///
   /// [qqSongMid] 必需：QQ音乐来源的歌用真实 mid；
   /// 手动录入或来源不明时用 `title|artist` 派生（见 [deriveMid]）。
+  /// [metaSourceType]/[metaSourceId] 默认从 qqSongMid 派生（'qq' + qqSongMid），
+  /// 将来接入其他元数据源时调用方传入正确值。
   factory SongRow.fromSong(
     Song song, {
     required String qqSongMid,
     String albumMid = '',
+    String singerMid = '',
+    int? singerId,
+    String metaSourceType = 'qq',
+    String? metaSourceId,
     int? createdAt,
     int? now,
   }) {
     final ts = now ?? DateTime.now().millisecondsSinceEpoch ~/ 1000;
     final release = song.releaseDate;
+    final effectiveMetaId = metaSourceId ?? qqSongMid;
     return SongRow(
       qqSongMid: qqSongMid,
+      metaSourceType: metaSourceType,
+      metaSourceId: effectiveMetaId,
       title: song.title,
       artists: song.artist,
       album: song.album,
       albumMid: albumMid,
+      singerMid: singerMid,
+      singerId: singerId,
       lyricist: song.lyricist,
       composer: song.composer,
       arranger: song.arranger,
@@ -117,6 +163,7 @@ class SongRow {
           release == null ? null : release.millisecondsSinceEpoch ~/ 1000,
       durationMs: song.duration * 1000,
       coverSeed: song.coverSeed,
+      lyricOffsetMs: song.lyricOffsetMs,
       createdAt: createdAt ?? ts,
       updatedAt: ts,
     );
@@ -130,6 +177,7 @@ class SongRow {
       title: title,
       artist: artists,
       album: album,
+      albumMid: albumMid.isEmpty ? null : albumMid,
       duration: durationMs ~/ 1000,
       lyricist: lyricist,
       composer: composer,
@@ -145,6 +193,10 @@ class SongRow {
       // 封面 URL 从落库的 album_mid 拼出（读回即带，UI 不必再查详情）。
       // album_mid 为空（mock/手动录入）→ null → UI 回退占位渐变。
       coverUrl: QQSongMeta.coverUrlFor(albumMid),
+      // singerMid 为空字符串时转 null（与 Song 模型的可空语义对齐）
+      singerMid: singerMid.isEmpty ? null : singerMid,
+      singerId: singerId,
+      lyricOffsetMs: lyricOffsetMs,
     );
   }
 
@@ -162,6 +214,17 @@ class SongRow {
 class VideoRow {
   final String bvid;
   final int cid;
+
+  /// 通用音源类型 —— 'bilibili' / 'youtube' / ...（未来扩展）
+  final String sourceType;
+
+  /// 通用音源主键 —— 对 B站 = bvid，对 YouTube = videoId，等等
+  final String sourceKey;
+
+  /// 通用音源子键 —— 对 B站 = cid.toString()（分P定位），
+  /// 对无分P的平台可留空
+  final String sourceSubKey;
+
   final String title;
   final String author;
   final int mid;
@@ -182,6 +245,9 @@ class VideoRow {
   const VideoRow({
     required this.bvid,
     required this.cid,
+    this.sourceType = 'bilibili',
+    this.sourceKey = '',
+    this.sourceSubKey = '',
     required this.title,
     this.author = '',
     this.mid = 0,
@@ -203,6 +269,11 @@ class VideoRow {
   Map<String, Object?> toMap() => {
         'bvid': bvid,
         'cid': cid,
+        // 双写：source_key/source_sub_key 与 bvid/cid 冗余副本
+        // 旧库只在 (bvid) 上有主键约束，新库 UNIQUE 还没改（步骤 8）
+        'source_type': sourceType,
+        'source_key': sourceKey.isEmpty ? bvid : sourceKey,
+        'source_sub_key': sourceSubKey.isEmpty ? cid.toString() : sourceSubKey,
         'title': title,
         'author': author,
         'mid': mid,
@@ -226,26 +297,37 @@ class VideoRow {
         'unavailable_reason': unavailableReason,
       };
 
-  factory VideoRow.fromMap(Map<String, Object?> m) => VideoRow(
-        bvid: m['bvid'] as String? ?? '',
-        cid: m['cid'] as int? ?? 0,
-        title: m['title'] as String? ?? '',
-        author: m['author'] as String? ?? '',
-        mid: m['mid'] as int? ?? 0,
-        durationMs: m['duration_ms'] as int? ?? 0,
-        typename: m['typename'] as String? ?? '',
-        tag: m['tag'] as String?,
-        description: m['description'] as String?,
-        playCount: m['play_count'] as int? ?? 0,
-        pubdate: m['pubdate'] as int? ?? 0,
-        fetchedAt: m['fetched_at'] as int? ?? 0,
-        audioUrl: m['audio_url'] as String?,
-        audioUrlExpireAt: m['audio_url_expire_at'] as int?,
-        audioQualityId: m['audio_quality_id'] as int?,
-        audioBitrate: m['audio_bitrate'] as int?,
-        available: (m['available'] as int? ?? 1) == 1,
-        unavailableReason: m['unavailable_reason'] as String?,
-      );
+  factory VideoRow.fromMap(Map<String, Object?> m) {
+    // 读通用列，为空时兜底从旧列派生（兼容 v4→v5 迁移前的老行）
+    final srcType = m['source_type'] as String?;
+    final srcKey = m['source_key'] as String?;
+    final srcSub = m['source_sub_key'] as String?;
+    final bvid = m['bvid'] as String? ?? '';
+    final cid = m['cid'] as int? ?? 0;
+    return VideoRow(
+      bvid: bvid,
+      cid: cid,
+      sourceType: (srcType != null && srcType.isNotEmpty) ? srcType : 'bilibili',
+      sourceKey: (srcKey != null && srcKey.isNotEmpty) ? srcKey : bvid,
+      sourceSubKey: (srcSub != null && srcSub.isNotEmpty) ? srcSub : cid.toString(),
+      title: m['title'] as String? ?? '',
+      author: m['author'] as String? ?? '',
+      mid: m['mid'] as int? ?? 0,
+      durationMs: m['duration_ms'] as int? ?? 0,
+      typename: m['typename'] as String? ?? '',
+      tag: m['tag'] as String?,
+      description: m['description'] as String?,
+      playCount: m['play_count'] as int? ?? 0,
+      pubdate: m['pubdate'] as int? ?? 0,
+      fetchedAt: m['fetched_at'] as int? ?? 0,
+      audioUrl: m['audio_url'] as String?,
+      audioUrlExpireAt: m['audio_url_expire_at'] as int?,
+      audioQualityId: m['audio_quality_id'] as int?,
+      audioBitrate: m['audio_bitrate'] as int?,
+      available: (m['available'] as int? ?? 1) == 1,
+      unavailableReason: m['unavailable_reason'] as String?,
+    );
+  }
 
   bool get isAudioUrlValid {
     if (audioUrl == null || audioUrl!.isEmpty) return false;
@@ -261,6 +343,13 @@ class BindingRow {
   final int? id;
   final int songId;
   final String bvid;
+
+  /// 通用音源类型 —— 默认 'bilibili'（步骤 6 双写期冗余副本）
+  final String sourceType;
+
+  /// 通用音源主键 —— 默认等于 bvid
+  final String sourceKey;
+
   final bool isActive;
   final double matchScore;
   final MatchConfidence confidence;
@@ -275,6 +364,8 @@ class BindingRow {
     this.id,
     required this.songId,
     required this.bvid,
+    this.sourceType = 'bilibili',
+    this.sourceKey = '',
     this.isActive = false,
     required this.matchScore,
     required this.confidence,
@@ -288,6 +379,9 @@ class BindingRow {
         if (id != null) 'id': id,
         'song_id': songId,
         'bvid': bvid,
+        // 双写：source_type/source_key 与 bvid 冗余副本
+        'source_type': sourceType,
+        'source_key': sourceKey.isEmpty ? bvid : sourceKey,
         'is_active': isActive ? 1 : 0,
         'match_score': matchScore,
         'confidence': confidence.label,
@@ -297,18 +391,26 @@ class BindingRow {
         'note': note,
       };
 
-  factory BindingRow.fromMap(Map<String, Object?> m) => BindingRow(
-        id: m['id'] as int?,
-        songId: m['song_id'] as int? ?? 0,
-        bvid: m['bvid'] as String? ?? '',
-        isActive: (m['is_active'] as int? ?? 0) == 1,
-        matchScore: (m['match_score'] as num?)?.toDouble() ?? 0,
-        confidence: _parseConfidence(m['confidence']?.toString()),
-        scoreDetail: m['score_detail'] as String?,
-        matchType: _parseMatchType(m['match_type']?.toString()),
-        matchedAt: m['matched_at'] as int? ?? 0,
-        note: m['note'] as String?,
-      );
+  factory BindingRow.fromMap(Map<String, Object?> m) {
+    // 读通用列，为空时兜底从旧列派生
+    final srcType = m['source_type'] as String?;
+    final srcKey = m['source_key'] as String?;
+    final bvid = m['bvid'] as String? ?? '';
+    return BindingRow(
+      id: m['id'] as int?,
+      songId: m['song_id'] as int? ?? 0,
+      bvid: bvid,
+      sourceType: (srcType != null && srcType.isNotEmpty) ? srcType : 'bilibili',
+      sourceKey: (srcKey != null && srcKey.isNotEmpty) ? srcKey : bvid,
+      isActive: (m['is_active'] as int? ?? 0) == 1,
+      matchScore: (m['match_score'] as num?)?.toDouble() ?? 0,
+      confidence: _parseConfidence(m['confidence']?.toString()),
+      scoreDetail: m['score_detail'] as String?,
+      matchType: _parseMatchType(m['match_type']?.toString()),
+      matchedAt: m['matched_at'] as int? ?? 0,
+      note: m['note'] as String?,
+    );
+  }
 
   /// 从打分结果构造（自动匹配路径）
   factory BindingRow.fromScored({
@@ -318,9 +420,12 @@ class BindingRow {
     String? note,
     int? now,
   }) {
+    final bvid = scored.video.bvid;
     return BindingRow(
       songId: songId,
-      bvid: scored.video.bvid,
+      bvid: bvid,
+      sourceType: 'bilibili',
+      sourceKey: bvid,
       isActive: isActive,
       matchScore: scored.total,
       confidence: scored.confidence,
@@ -346,6 +451,8 @@ class BindingRow {
     return BindingRow(
       songId: songId,
       bvid: bvid,
+      sourceType: 'bilibili',
+      sourceKey: bvid,
       isActive: true,
       matchScore: score,
       // 人工绑定的置信度必然是确定的，标 AUTO 表示「可直接播放」

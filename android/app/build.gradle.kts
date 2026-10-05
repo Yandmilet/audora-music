@@ -20,7 +20,7 @@ val hasReleaseSigning = keystorePropertiesFile.exists() && runCatching {
 }.getOrDefault(false)
 
 android {
-    namespace = "com.audora.audora2"
+    namespace = "com.fly1pu.audoramusic"
     // compileSdk 显式取 37：permission_handler 13.x 的 AAR 元数据要求宿主
     // 以 SDK 37 编译（AGP 9.1 的 max-recommended 仍是 36，但那只是警告）。
     // Flutter SDK 自身的 flutter.compileSdkVersion 跟随 Flutter 版本（当前 36）。
@@ -33,7 +33,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.audora.audora2"
+        applicationId = "com.fly1pu.audoramusic"
         // minSdk 由 Flutter 工具强制为 24（Android 7.0+）：
         // 写 23 会在每次构建时被 flutter tool 自动改回 flutter.minSdkVersion
         minSdk = flutter.minSdkVersion

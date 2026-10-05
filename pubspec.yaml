@@ -10,10 +10,6 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  cupertino_icons: ^1.0.8
-
-  # 状态管理（可替换为 Riverpod）
-  provider: ^6.1.2
 
   # 本地数据库（歌曲 / 收藏 / 音源映射）
   sqflite: ^2.3.3

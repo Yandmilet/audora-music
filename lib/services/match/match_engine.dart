@@ -12,10 +12,10 @@
 library;
 
 import '../../models/models.dart';
-import '../bilibili/bili_api.dart';
 import '../bilibili/bili_dto.dart';
 import '../diag/diag_log.dart';
 import '../net/rate_limiter.dart';
+import '../source/audio_source_provider.dart';
 import 'match_config.dart';
 import 'match_scorer.dart';
 import 'text_normalizer.dart';
@@ -60,10 +60,14 @@ class MatchResult {
 }
 
 class MatchEngine {
-  MatchEngine(this.api, {RateLimiter? rateLimiter})
+  MatchEngine(this.sourceProvider, {RateLimiter? rateLimiter})
       : rateLimiter = rateLimiter ?? RateLimiter();
 
-  final BiliApi api;
+  /// 音频源 Provider（搜索候选 / 拉详情）。
+  ///
+  /// 当前注入的是 [BiliAudioSourceAdapter] 包装后的 BiliApi；
+  /// 未来换 YouTube Music / 网易云音频源时只换 Adapter，匹配流水线不动。
+  final AudioSourceProvider sourceProvider;
 
   /// 与 api 客户端共用同一个限流器时传入外部实例；
   /// 独立使用时用默认的 30次/分钟。
@@ -123,10 +127,29 @@ class MatchEngine {
   /// 这里放长不会造成「绑死失效音源」的问题。
   static const Duration _searchTtl = Duration(hours: 24);
 
-  /// 清空搜索缓存。
+  /// v0.7：搜索负结果缓存。
+  ///
+  /// ## 为什么值得单独存
+  /// 正常缓存 24h + 只存成功结果 → 空结果会每次重发搜索，
+  /// 批量匹配「B站确实没有这首歌」时每首都白白消耗 2~4 次搜索额度。
+  /// 负缓存只存「服务端正常返回但列表为空」的情况（网络异常/风控不写），
+  /// 给视频上传/风控解除留重试空间。
+  ///
+  /// ## 为什么 TTL 更短、容量更小
+  /// 负结果容易过时——今天搜不到的关键词，明天可能 UP 主传了视频。
+  /// TTL 3h 是 24h 的 1/8，容量 100 是 300 的 1/3，
+  /// 让负结果更快过期且不挤占正常缓存容量。
+  final Map<String, DateTime> _negativeSearchCache = {};
+  static const int _negativeSearchCacheCap = 100;
+  static const Duration _negativeSearchTtl = Duration(hours: 3);
+
+  /// 清空搜索缓存（含正结果 + 负结果）。
   ///
   /// 用途与 [clearDetailCache] 相同：单测隔离、强制重新匹配。
-  void clearSearchCache() => _searchCache.clear();
+  void clearSearchCache() {
+    _searchCache.clear();
+    _negativeSearchCache.clear();
+  }
 
   /// 供「手动搜索音源」使用的带缓存搜索（公开入口）。
   ///
@@ -151,11 +174,21 @@ class MatchEngine {
   ///
   /// 外层只负责「开始 / 结束」两条诊断日志与耗时统计，
   /// 流水线本体在 [_matchImpl] —— 分开是为了让日志逻辑不掺进四阶段代码里。
+  ///
+  /// [trustedUploaderMids]：v0.7 新增，已被其他歌曲验证过的 UP 主 mid 集合。
+  /// 传入后会在 Stage 4 给这些 UP 主的候选额外加分（跨歌学习信号）。
   Future<MatchResult> match(
     Song song, {
     /// 已知失效的 bvid，直接排除（设计文档 8.3 的自动修复）
     Set<String> excludeBvids = const {},
     void Function(String stage, String msg)? onLog,
+
+    /// v0.7：已验证可信的 UP 主 mid 集合（跨歌学习）
+    Set<int> trustedUploaderMids = const {},
+
+    /// v0.7：已被激活过的 bvid 集合（灰区二次校验）
+    /// REVIEW 区间的候选若命中此集合，直接抬升为 AUTO
+    Set<String> trustedBvids = const {},
   }) async {
     final sw = Stopwatch()..start();
     DiagLog.instance.i(
@@ -166,12 +199,20 @@ class MatchEngine {
         'song': song.title,
         'artist': song.artist,
         'duration': song.duration,
+        if (trustedUploaderMids.isNotEmpty)
+          'trustedMids': trustedUploaderMids.length,
       },
     );
 
     final MatchResult r;
     try {
-      r = await _matchImpl(song, excludeBvids: excludeBvids, onLog: onLog);
+      r = await _matchImpl(
+        song,
+        excludeBvids: excludeBvids,
+        onLog: onLog,
+        trustedUploaderMids: trustedUploaderMids,
+        trustedBvids: trustedBvids,
+      );
     } catch (e) {
       DiagLog.instance.e(
         DiagCategory.match,
@@ -210,7 +251,8 @@ class MatchEngine {
           'detail': best.detail.toJson(),
         },
         'ms': sw.elapsedMilliseconds,
-        if (r.diagnostics.isNotEmpty) 'diagnostics': r.diagnostics.take(20).toList(),
+        if (r.diagnostics.isNotEmpty)
+          'diagnostics': r.diagnostics.take(20).toList(),
       },
     );
     return r;
@@ -220,6 +262,8 @@ class MatchEngine {
     Song song, {
     Set<String> excludeBvids = const {},
     void Function(String stage, String msg)? onLog,
+    Set<int> trustedUploaderMids = const {},
+    Set<String> trustedBvids = const {},
   }) async {
     final diag = <String>[];
 
@@ -233,7 +277,8 @@ class MatchEngine {
         fields: {'count': pool.length});
 
     // ── Stage 2：硬过滤 ──────────────────────────────────
-    final filtered = _hardFilter(pool, song, excludeBvids, diag: diag, onLog: onLog);
+    final filtered =
+        _hardFilter(pool, song, excludeBvids, diag: diag, onLog: onLog);
     if (filtered.isEmpty) {
       diag.add('Stage2：全部候选被硬过滤淘汰');
       // 降级策略（设计文档 10.1「全部候选被硬过滤」）：
@@ -245,19 +290,73 @@ class MatchEngine {
       diag.add('Stage2降级：放宽黑名单后保留 ${relaxed.length} 条，结果强制 REVIEW');
       _stage(onLog, 'Stage2', '降级保留 ${relaxed.length} 条',
           fields: {'count': relaxed.length});
-      return _enrichAndScore(
-        relaxed,
-        song,
-        diag: diag,
-        onLog: onLog,
-        forceReview: true,
+      return _liftTrustedBvids(
+        await _enrichAndScore(
+          relaxed,
+          song,
+          diag: diag,
+          onLog: onLog,
+          forceReview: true,
+          trustedUploaderMids: trustedUploaderMids,
+        ),
+        trustedBvids,
       );
     }
     _stage(onLog, 'Stage2', '硬过滤后剩 ${filtered.length} 条',
         fields: {'count': filtered.length});
 
     // ── Stage 3 + Stage 4 ────────────────────────────────
-    return _enrichAndScore(filtered, song, diag: diag, onLog: onLog);
+    return _liftTrustedBvids(
+      await _enrichAndScore(
+        filtered,
+        song,
+        diag: diag,
+        onLog: onLog,
+        trustedUploaderMids: trustedUploaderMids,
+      ),
+      trustedBvids,
+    );
+  }
+
+  /// v0.7：已激活 bvid 抬升——灰区二次校验。
+  ///
+  /// REVIEW 区间的候选如果 bvid 已被其他歌曲激活过，
+  /// 说明这个音源是可用且被用户确认过的，直接抬升为 AUTO。
+  ///
+  /// 这是跨歌学习的第二通道：
+  ///   - trustedUploaderMids（同 UP 主）→ Stage 4 S3 加分
+  ///   - trustedBvids（同音源）→ post-processing 直接抬升置信度
+  MatchResult _liftTrustedBvids(MatchResult result, Set<String> trustedBvids) {
+    if (trustedBvids.isEmpty || !result.hasCandidate) return result;
+
+    final best = result.best!;
+    if (best.confidence != MatchConfidence.review) return result;
+    if (!trustedBvids.contains(best.video.bvid)) return result;
+
+    final lifted = ScoredCandidate(
+      video: best.video,
+      total: best.total,
+      detail: best.detail,
+      confidence: MatchConfidence.auto,
+    );
+    DiagLog.instance.i(
+      DiagCategory.match,
+      'v0.7 抬升：${best.video.bvid} 已被其他歌曲激活，REVIEW → AUTO',
+      {
+        'event': 'lift',
+        'bvid': best.video.bvid,
+        'from': 'REVIEW',
+        'to': 'AUTO'
+      },
+    );
+    return MatchResult(
+      best: lifted,
+      runnerUps: result.runnerUps,
+      diagnostics: [
+        ...result.diagnostics,
+        'v0.7 抬升：${best.video.bvid} 已被激活，REVIEW → AUTO',
+      ],
+    );
   }
 
   /// 阶段日志：同时喂给调用方的 [onLog] 回调与诊断日志。
@@ -295,12 +394,12 @@ class MatchEngine {
   ///
   /// Q4 的「无损」是**查询词增强而非硬过滤**——部分优质音源标题不写「无损」，
   /// 当成过滤条件会把它们全杀掉（设计文档 13.6 修正项 ①）。
-  /// [allowFullScanFallback] 见下方「分档搜索为空」处的说明。
-  /// **外部调用方不要传 false**，它只服务于内部的一次性回退。
+  ///
+  /// 注：分档 → 全量的回退由 `BiliApi.searchWithFallback` 内部完成
+  /// （见 bili_api.dart），这里不再重复实现。
   Future<List<VideoCandidate>> _recall(
     Song song, {
     void Function(String stage, String msg)? onLog,
-    bool allowFullScanFallback = true,
   }) async {
     final artist1 = _firstArtist(song.artist);
     final durationFilter = MatchConfig.durationFilterFor(song.duration * 1000);
@@ -345,17 +444,6 @@ class MatchEngine {
       }
     }
 
-    // 服务端分档可能过度过滤。这里只允许一次显式全量回退。
-    if (pool.isEmpty && durationFilter != 0 && allowFullScanFallback) {
-      _stage(
-        onLog,
-        'Stage1',
-        '分档搜索为空，回退全量搜索',
-        level: DiagLevel.warn,
-      );
-      return _recall(song, onLog: onLog, allowFullScanFallback: false);
-    }
-
     return pool;
   }
 
@@ -378,12 +466,17 @@ class MatchEngine {
   }
 
   /// 搜索阶段只使用已经存在的字段做廉价判断。
-  /// 同时要求“数量 + 强证据”，避免因为单个偶然命中而跳过 Q3/Q4。
+  ///
+  /// 只要求**足够多的强证据**（≥ 3 条标题+时长双命中），不强求候选池总量。
+  /// 之前有个 `candidates.length >= minRecallCandidates` 的硬性门槛——
+  /// Q1 只搜出 5 条但其中 4 条都是强候选时，因为池子不到 12 条就还会发 Q3/Q4，
+  /// 白白消耗 2 次搜索额度。现在删掉这个门槛：≥ 3 条强候选就够了，
+  /// 池子大小不影响判断。
   bool _recallIsAlreadyStrong(
     List<VideoCandidate> candidates,
     Song song,
   ) {
-    if (candidates.length < MatchConfig.minRecallCandidates) return false;
+    if (candidates.isEmpty) return false;
 
     final songTitle = TextNormalizer.normalize(song.title);
     if (songTitle.isEmpty) return false;
@@ -400,8 +493,6 @@ class MatchEngine {
         if (diff > 5000) continue;
       }
 
-      // 标题/时长已经是两个最高权重判断维；这里不调用完整 scorer，
-      // 避免为了决定是否发搜索请求又做大量模糊匹配。
       strong++;
       if (strong >= 3) return true;
     }
@@ -416,42 +507,66 @@ class MatchEngine {
   }) async {
     // 缓存 key：关键词 + 分档。同词不同档是不同结果集，必须区分。
     final key = '$durationFilter|$keyword';
+    final now = DateTime.now();
+
+    // 1) 正常缓存命中 → 直接返回
     final hit = _searchCache[key];
-    if (hit != null && DateTime.now().difference(hit.at) < _searchTtl) {
+    if (hit != null && now.difference(hit.at) < _searchTtl) {
       _stage(onLog, 'Stage1', '查询「$keyword」命中缓存 ${hit.list.length} 条',
           fields: {'keyword': keyword, 'count': hit.list.length, 'cache': 1});
-      // 返回副本：上层（_mergeAndTrim 等）虽然目前只读遍历，
-      // 副本保证缓存永远不会被上层的排序/修改操作污染。
       return hit.list.toList();
     }
-    // 过期条目顺手清掉，避免它继续占着容量上限（与详情缓存同做法）
     if (hit != null) _searchCache.remove(key);
 
+    // 2) v0.7：负结果缓存命中（服务端确实没这个关键词）→ 省掉一次搜索
+    // 注意：负缓存先于正常缓存检查——正常缓存过期后，负缓存可能还在有效期内
+    final negativeHit = _negativeSearchCache[key];
+    if (negativeHit != null &&
+        now.difference(negativeHit) < _negativeSearchTtl) {
+      _stage(onLog, 'Stage1', '查询「$keyword」命中负缓存（近期无结果）',
+          fields: {'keyword': keyword, 'cache': 'negative'});
+      return const [];
+    }
+    if (negativeHit != null) _negativeSearchCache.remove(key);
+
     try {
-      final list = await api.searchWithFallback(
+      final list = await sourceProvider.searchWithFallback(
         keyword,
         durationFilter: durationFilter,
         maxRetries: maxRetries,
       );
+      // 通用 SourceCandidate → B站专属 VideoCandidate（保持流水线不变）
+      final candidates = list.map(_toVideoCandidate).toList();
       // 每路返回条数都记下来：Stage1「四路召回」各自贡献多少，
       // 是判断"要不要砍掉某一路"的直接依据（限流优化的数据来源）
-      _stage(onLog, 'Stage1', '查询「$keyword」返回 ${list.length} 条',
-          fields: {'keyword': keyword, 'count': list.length});
+      _stage(onLog, 'Stage1', '查询「$keyword」返回 ${candidates.length} 条',
+          fields: {'keyword': keyword, 'count': candidates.length});
 
-      if (_searchCache.length >= _searchCacheCap) {
-        _searchCache.remove(_searchCache.keys.first);
+      if (candidates.isEmpty) {
+        // v0.7：空结果写入负缓存（仅服务端正常返回空的情况，网络异常走 catch）
+        if (_negativeSearchCache.length >= _negativeSearchCacheCap) {
+          _negativeSearchCache.remove(_negativeSearchCache.keys.first);
+        }
+        _negativeSearchCache[key] = now;
+      } else {
+        // 有结果：清除同 key 的负缓存（之前的负缓存可能已过时）
+        _negativeSearchCache.remove(key);
+
+        if (_searchCache.length >= _searchCacheCap) {
+          _searchCache.remove(_searchCache.keys.first);
+        }
+        // 存不可变副本：_searchSafe 的调用方拿到的 list 若被原地排序，
+        // 也不会污染缓存内容
+        _searchCache[key] = _CachedSearch(
+          List<VideoCandidate>.unmodifiable(candidates),
+          now,
+        );
       }
-      // 存不可变副本：_searchSafe 的调用方拿到的 list 若被原地排序，
-      // 也不会污染缓存内容
-      _searchCache[key] = _CachedSearch(
-        List<VideoCandidate>.unmodifiable(list),
-        DateTime.now(),
-      );
-      return list;
+      return candidates;
     } catch (e) {
       _stage(onLog, 'Stage1', '查询「$keyword」失败：$e',
           level: DiagLevel.warn, fields: {'keyword': keyword});
-      // 失败不写缓存：一次网络抖动不该让这首歌在 TTL 内匹配不到
+      // 失败不写任何缓存：一次网络抖动不该让这首歌在 TTL 内匹配不到
       return const [];
     }
   }
@@ -466,6 +581,7 @@ class MatchEngine {
     void Function(String stage, String msg)? onLog,
   }) {
     final songMs = song.duration * 1000;
+    final durationTolerance = MatchConfig.durationToleranceFor(songMs);
     final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
     final result = <VideoCandidate>[];
     // 黑名单词的小写副本提到循环外：原来「每候选 × 每词」都重复
@@ -492,11 +608,24 @@ class MatchEngine {
         continue;
       }
 
-      // 2) 时长粗筛。用绝对值：音乐视频常加片头/封面页，B站时长会比歌曲略长
+      // 1.5) 低相关分区提前拦截（节流 Stage 3 配额）。
+      // 搜索接口已返回 typename，鬼畜/搞笑/游戏这类分区与音乐匹配天然低相关，
+      // 注定在 Stage 4 因为分区减分输掉。提前杀掉不影响精准度，但能省下
+      // 详情请求额度。注意：搜索结果的 typename 可能为空（B站有时不返回），
+      // 空值跳过让候选继续走，不做过度过滤。
+      if (v.typename.isNotEmpty &&
+          MatchConfig.lowRelevancePartitions.contains(v.typename)) {
+        diag.add('${v.bvid}：低相关分区「${v.typename}」，提前淘汰');
+        continue;
+      }
+
+      // 2) 时长粗筛。用绝对值：音乐视频常加片头/封面页，B站时长会比歌曲略长。
+      // 动态容忍：短歌收紧到 15%，长歌 30s 封顶（见 MatchConfig.durationToleranceFor）。
       if (songMs > 0 && v.durationMs > 0) {
         final diff = (v.durationMs - songMs).abs();
-        if (diff > MatchConfig.durationToleranceMs) {
-          diag.add('${v.bvid}：时长粗筛不过（差 ${diff ~/ 1000}s）');
+        if (diff > durationTolerance) {
+          diag.add(
+              '${v.bvid}：时长粗筛不过（差 ${diff ~/ 1000}s，容忍 ${durationTolerance ~/ 1000}s）');
           continue;
         }
       }
@@ -525,12 +654,17 @@ class MatchEngine {
     Set<String> excludeBvids,
   ) {
     final songMs = song.duration * 1000;
+    // 降级路径的容忍也按动态公式放宽 2 倍，但保持绝对上限。
+    final relaxedTolerance = MatchConfig.durationToleranceFor(songMs) * 2;
+    const maxRelaxed = MatchConfig.durationToleranceMaxMs * 2;
+    final tolerance =
+        relaxedTolerance < maxRelaxed ? relaxedTolerance : maxRelaxed;
+
     return pool.where((v) {
       if (excludeBvids.contains(v.bvid)) return false;
       if (songMs > 0 && v.durationMs > 0) {
         final diff = (v.durationMs - songMs).abs();
-        // 降级时也放宽时长：从 30s 放到 60s
-        if (diff > MatchConfig.durationToleranceMs * 2) return false;
+        if (diff > tolerance) return false;
       }
       return true;
     }).toList();
@@ -565,6 +699,7 @@ class MatchEngine {
     List<VideoCandidate> candidates,
     Song song, {
     void Function(String stage, String msg)? onLog,
+    Set<int> trustedUploaderMids = const {},
   }) {
     if (candidates.isEmpty) return const [];
 
@@ -572,7 +707,11 @@ class MatchEngine {
     final scored = candidates
         .map((c) => _PreselectedCandidate(
               candidate: c,
-              coarseScore: MatchScorer.score(c, song).total,
+              coarseScore: MatchScorer.score(
+                c,
+                song,
+                trustedUploaderMids: trustedUploaderMids,
+              ).total,
             ))
         .toList()
       ..sort((a, b) => b.coarseScore.compareTo(a.coarseScore));
@@ -618,8 +757,14 @@ class MatchEngine {
     required List<String> diag,
     void Function(String stage, String msg)? onLog,
     bool forceReview = false,
+    Set<int> trustedUploaderMids = const {},
   }) async {
-    final selected = _preselect(candidates, song, onLog: onLog);
+    final selected = _preselect(
+      candidates,
+      song,
+      onLog: onLog,
+      trustedUploaderMids: trustedUploaderMids,
+    );
     if (selected.isEmpty) {
       diag.add('Stage3：预筛无候选');
       return MatchResult(diagnostics: diag);
@@ -630,8 +775,12 @@ class MatchEngine {
 
     // 分批补详情。首批已经出现“非常强且明显领先”的候选时，
     // 不再请求后续候选，避免为一个已经确定的结果继续消耗限流额度。
-    for (var start = 0; start < selected.length; start += MatchConfig.enrichBatchSize) {
-      final end = (start + MatchConfig.enrichBatchSize).clamp(0, selected.length).toInt();
+    for (var start = 0;
+        start < selected.length;
+        start += MatchConfig.enrichBatchSize) {
+      final end = (start + MatchConfig.enrichBatchSize)
+          .clamp(0, selected.length)
+          .toInt();
       final batch = selected.sublist(start, end);
       requested += batch.length;
 
@@ -642,7 +791,8 @@ class MatchEngine {
       );
 
       for (final v in enriched) {
-        scored.add(MatchScorer.score(v, song));
+        scored.add(MatchScorer.score(v, song,
+            trustedUploaderMids: trustedUploaderMids));
       }
 
       if (scored.isNotEmpty) {
@@ -655,7 +805,8 @@ class MatchEngine {
 
         if (!forceReview &&
             best.total >= MatchConfig.earlyAutoThreshold &&
-            (nextCoarse < 0 || best.total - nextCoarse >= MatchConfig.earlyStopGap)) {
+            (nextCoarse < 0 ||
+                best.total - nextCoarse >= MatchConfig.earlyStopGap)) {
           _stage(
             onLog,
             'Stage3',
@@ -676,7 +827,7 @@ class MatchEngine {
       onLog,
       'Stage3',
       '详情补全并评分 ${scored.length} 条，实际请求 $requested/${selected.length} 条'
-      '（候选池 ${candidates.length} 条）',
+          '（候选池 ${candidates.length} 条）',
       fields: {
         'scored': scored.length,
         'requested': requested,
@@ -750,13 +901,14 @@ class MatchEngine {
 
     // 多分P处理（设计文档 4.5.2）：合辑视频的标题通常含专辑名，
     // 时长校验必须落到分P粒度才能通过。
-    final bestPage = _pickBestPage(detail.pages, song.duration * 1000);
+    final bestPage = _pickBestPage(detail.pages, song);
 
     if (bestPage != null) {
       return base.copyWith(
         durationSec: bestPage.durationSec,
         cid: bestPage.cid,
         author: detail.ownerName,
+        mid: detail.ownerMid,
         typename: detail.tname,
         play: detail.playCount,
         pubdate: detail.pubdate,
@@ -773,9 +925,11 @@ class MatchEngine {
     }
 
     return base.copyWith(
-      durationSec: detail.durationSec > 0 ? detail.durationSec : base.durationSec,
+      durationSec:
+          detail.durationSec > 0 ? detail.durationSec : base.durationSec,
       cid: detail.cid,
       author: detail.ownerName,
+      mid: detail.ownerMid,
       typename: detail.tname,
       play: detail.playCount,
       pubdate: detail.pubdate,
@@ -785,44 +939,146 @@ class MatchEngine {
   }
 
   /// 带缓存的详情查询。只缓存成功结果（null 代表视频失效，必须每次现查）。
-  Future<VideoDetail?> _detailOf(String bvid) async {
-    final hit = _detailCache[bvid];
+  Future<VideoDetail?> _detailOf(String sourceKey) async {
+    final hit = _detailCache[sourceKey];
     if (hit != null && DateTime.now().difference(hit.at) < _detailTtl) {
       return hit.detail;
     }
     // 过期条目顺手清掉，避免它继续占着容量上限
-    if (hit != null) _detailCache.remove(bvid);
+    if (hit != null) _detailCache.remove(sourceKey);
 
-    final detail = await api.fetchVideoDetail(bvid);
-    if (detail != null) {
+    final sourceDetail = await sourceProvider.fetchSourceDetail(sourceKey);
+    if (sourceDetail != null) {
+      final detail = _toVideoDetail(sourceDetail);
       if (_detailCache.length >= _detailCacheCap) {
         _detailCache.remove(_detailCache.keys.first);
       }
-      _detailCache[bvid] = _CachedDetail(detail, DateTime.now());
+      _detailCache[sourceKey] = _CachedDetail(detail, DateTime.now());
+      return detail;
     }
-    return detail;
+    return null;
   }
 
-  /// 从分P列表里挑时长最接近歌曲的那一P
+  // ═══════════════════════════════════════════════════════════════
+  // DTO 转换：通用类型 → B站专属类型（流水线内部继续用 B站 DTO）
+  //
+  // 为什么在这里做：MatchEngine 的 Stage1/2/3/4 流水线内部大量使用
+  // VideoCandidate / VideoDetail / VideoPage 字段（如 .bvid / .cid /
+  // .typename / .pages），这些是 B站专属命名。直接把流水线全泛化成本极高。
+  // 在 Adapter 边界转一次，流水线零改动。
+  // ═══════════════════════════════════════════════════════════════
+
+  /// SourceCandidate → VideoCandidate
+  VideoCandidate _toVideoCandidate(SourceCandidate s) => VideoCandidate(
+        bvid: s.sourceKey,
+        cid: int.tryParse(s.sourceSubKey) ?? 0,
+        title: s.title,
+        author: s.author,
+        durationSec: s.durationSec,
+        play: s.playCount,
+        typename: s.category,
+      );
+
+  /// SourceDetail → VideoDetail
+  VideoDetail _toVideoDetail(SourceDetail s) => VideoDetail(
+        bvid: s.sourceKey,
+        cid: int.tryParse(s.sourceSubKey) ?? 0,
+        title: s.title,
+        ownerName: s.uploaderName,
+        ownerMid: s.uploaderId,
+        tname: s.category,
+        durationSec: s.durationSec,
+        playCount: s.playCount,
+        pubdate: s.pubdate,
+        pic: s.coverUrl,
+        pages: s.subItems
+            .map((p) => VideoPage(
+                  cid: int.tryParse(p.sourceSubKey) ?? 0,
+                  page: p.pageIndex,
+                  part: p.title,
+                  durationSec: p.durationSec,
+                ))
+            .toList(),
+        tag: s.tag,
+      );
+
+  /// 从分P列表里挑时长最接近歌曲的那一P。
+  ///
+  /// ## 时长优先 + 标题断
+  /// 物理证据（时长）比文本证据可靠，所以先按时长找最优候选。
+  /// 但合辑视频里常出现「两个分P时长极近但版本不同」的情况
+  /// （CD版 vs Live版），此时用 part 名与歌名的文本相似度做 tiebreaker。
   ///
   /// 设计文档 13.7 第 4 项提醒：NeriPlayer 只靠 `part == songName` 精确匹配
-  /// 分P名，但分P名常带序号前缀（如 `01. 秘密`）。这里的策略是
-  /// **优先用时长匹配**（物理证据比文本更可靠），必要时再结合分P名。
-  VideoPage? _pickBestPage(List<VideoPage> pages, int songMs) {
-    if (pages.isEmpty || songMs <= 0) return null;
+  /// 分P名，但分P名常带序号前缀（如 `01. 秘密`）。归一化后可以把这些
+  /// 干扰剥掉，让精确匹配生效。
+  VideoPage? _pickBestPage(List<VideoPage> pages, Song song) {
+    if (pages.isEmpty) return null;
+    final songMs = song.duration * 1000;
+    if (songMs <= 0) return null;
 
-    VideoPage? best;
+    final nSongTitle = TextNormalizer.normalize(song.title);
+
+    // ── 第一遍：只找时长最接近的 diff 值 ────────────────
+    // 不做 nearBest 累积，避免「找到更优后 clear 丢失仍在范围内的旧候选」。
     var bestDiff = MatchConfig.pageMatchToleranceMs + 1;
-
     for (final p in pages) {
       if (p.durationSec <= 0) continue;
       final diff = (p.durationSec * 1000 - songMs).abs();
-      if (diff < bestDiff) {
-        bestDiff = diff;
-        best = p;
+      if (diff < bestDiff) bestDiff = diff;
+    }
+
+    if (bestDiff > MatchConfig.pageMatchToleranceMs) {
+      // 所有分P的时长都离目标太远，放弃
+      return null;
+    }
+
+    // ── 第二遍：收集所有在最优 2 倍范围内的候选 ────────
+    final nearBest = <VideoPage>[];
+    VideoPage? bestByDuration;
+    for (final p in pages) {
+      if (p.durationSec <= 0) continue;
+      final diff = (p.durationSec * 1000 - songMs).abs();
+      if (diff > bestDiff * 2) continue;
+
+      nearBest.add(p);
+      if (bestByDuration == null ||
+          diff < (bestByDuration.durationSec * 1000 - songMs).abs()) {
+        bestByDuration = p;
       }
     }
-    return best;
+
+    if (nearBest.length == 1 || nSongTitle.isEmpty) return bestByDuration;
+
+    // ── 第三部分：用 part 名匹配歌名做 tiebreaker ────────
+    // 优先精确包含关系，避免模糊匹配的噪声
+    VideoPage? titleBest;
+    var titleBestScore = 0.0;
+
+    for (final p in nearBest) {
+      final nPart = TextNormalizer.normalize(p.part);
+      if (nPart.isEmpty) continue;
+
+      final double score;
+      if (nPart == nSongTitle) {
+        score = 3.0; // 精确命中
+      } else if (nPart.contains(nSongTitle)) {
+        score = 2.0; // part 含歌名
+      } else if (nSongTitle.contains(nPart) && nPart.length >= 2) {
+        score = 1.0; // 歌名含 part（短串豁免）
+      } else {
+        score = 0.0;
+      }
+
+      if (score > titleBestScore) {
+        titleBestScore = score;
+        titleBest = p;
+      }
+    }
+
+    // 只有确实有文本命中时才替换时长最优（score > 0）
+    if (titleBestScore > 0) return titleBest;
+    return bestByDuration;
   }
 
   // ── 工具 ─────────────────────────────────────────────────

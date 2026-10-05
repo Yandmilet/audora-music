@@ -19,9 +19,11 @@ import 'package:audora2/services/bilibili/bili_api_client.dart';
 import 'package:audora2/services/lyric/lrc_parser.dart';
 import 'package:audora2/services/lyric/lyric_translation.dart';
 import 'package:audora2/services/match/match_engine.dart';
+import 'package:audora2/services/metadata/qqmusic_metadata_adapter.dart';
 import 'package:audora2/services/netease/netease_provider.dart';
 import 'package:audora2/services/qqmusic/qqmusic_dto.dart';
 import 'package:audora2/services/qqmusic/qqmusic_provider.dart';
+import 'package:audora2/services/source/bili_audio_source_adapter.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -323,7 +325,7 @@ void main() {
       final repo = LibraryRepository(
         db: db,
         engine: _NoopEngine(),
-        qq: _StubQQ(lrc),
+        metadata: QQMusicMetadataAdapter(_StubQQ(lrc)),
         netease: ne,
       );
       final song = (await db.songs.getById(id))!.toSong();
@@ -373,7 +375,9 @@ void main() {
       final repo = LibraryRepository(
         db: db,
         engine: _NoopEngine(),
-        qq: _StubQQ('[00:01.00]Hello', trans: '[00:01.00]你好'),
+        metadata: QQMusicMetadataAdapter(
+          _StubQQ('[00:01.00]Hello', trans: '[00:01.00]你好'),
+        ),
         netease: ne,
       );
       final song = (await db.songs.getById(id))!.toSong();
@@ -400,7 +404,7 @@ void main() {
 // ── 桩 ───────────────────────────────────────────────────
 
 class _NoopEngine extends MatchEngine {
-  _NoopEngine() : super(BiliApi(BiliApiClient()));
+  _NoopEngine() : super(BiliAudioSourceAdapter(BiliApi(BiliApiClient())));
 }
 
 class _StubQQ extends QQMusicProvider {

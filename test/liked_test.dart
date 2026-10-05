@@ -21,8 +21,10 @@ import 'package:audora2/services/bilibili/bili_api.dart';
 import 'package:audora2/services/bilibili/bili_api_client.dart';
 import 'package:audora2/data/repository/library_repository.dart';
 import 'package:audora2/services/match/match_engine.dart';
+import 'package:audora2/services/metadata/qqmusic_metadata_adapter.dart';
 import 'package:audora2/services/qqmusic/qqmusic_dto.dart';
 import 'package:audora2/services/qqmusic/qqmusic_provider.dart';
+import 'package:audora2/services/source/bili_audio_source_adapter.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:path/path.dart' as p;
@@ -134,7 +136,11 @@ void main() {
       db = await AppDatabase.open(
         path: 'file:likepreserve$seq?mode=memory&cache=shared',
       );
-      repo = LibraryRepository(db: db, engine: _NoopEngine(), qq: _StubQQ());
+      repo = LibraryRepository(
+        db: db,
+        engine: _NoopEngine(),
+        metadata: QQMusicMetadataAdapter(_StubQQ()),
+      );
     });
 
     tearDown(() async => db.close());
@@ -256,7 +262,7 @@ void main() {
 // ── 构造辅助 ─────────────────────────────────────────────
 
 class _NoopEngine extends MatchEngine {
-  _NoopEngine() : super(BiliApi(BiliApiClient()));
+  _NoopEngine() : super(BiliAudioSourceAdapter(BiliApi(BiliApiClient())));
 }
 
 class _StubQQ extends QQMusicProvider {

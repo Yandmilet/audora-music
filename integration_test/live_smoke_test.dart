@@ -19,9 +19,11 @@ import 'package:audora2/services/bilibili/bili_api.dart';
 import 'package:audora2/services/bilibili/bili_api_client.dart';
 import 'package:audora2/services/match/match_config.dart';
 import 'package:audora2/services/match/match_engine.dart';
+import 'package:audora2/services/metadata/qqmusic_metadata_adapter.dart';
 import 'package:audora2/services/net/rate_limiter.dart';
 import 'package:audora2/services/lyric/lrc_parser.dart';
 import 'package:audora2/services/playback/source_resolver.dart';
+import 'package:audora2/services/source/bili_audio_source_adapter.dart';
 import 'package:audora2/services/qqmusic/qqmusic_dto.dart';
 import 'package:audora2/services/qqmusic/qqmusic_provider.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -38,10 +40,13 @@ void main() {
     db = await AppDatabase.open();
     final limiter = RateLimiter(maxRequests: 30, window: const Duration(minutes: 1));
     final client = BiliApiClient(rateLimiter: limiter);
+    // 与 main.dart 的装配保持一致：MatchEngine 吃 AudioSourceProvider 接口
+    // （BiliAudioSourceAdapter 包 BiliApi），元数据走 QQMusicMetadataAdapter。
+    final biliAdapter = BiliAudioSourceAdapter(BiliApi(client));
     repo = LibraryRepository(
       db: db,
-      engine: MatchEngine(BiliApi(client), rateLimiter: limiter),
-      qq: QQMusicProvider(),
+      engine: MatchEngine(biliAdapter, rateLimiter: limiter),
+      metadata: QQMusicMetadataAdapter(QQMusicProvider()),
     );
   });
 
@@ -62,7 +67,7 @@ void main() {
     for (final e in result.successes) {
       debugLog('  ✅ ${e.query.title} - ${e.query.artist} → '
           '「${e.song.title}」${e.song.artist} ${e.song.duration}s '
-          'mid=${e.songMid}');
+          'mid=${e.sourceId}');
     }
     for (final r in result.rejections) {
       debugLog('  ❌ ${r.query.title} - ${r.query.artist}：${r.reason}');
@@ -75,8 +80,8 @@ void main() {
     // ★ 真实 songMid 必须被带回来 —— 这是歌词能否取到的前提。
     // 曾经的缺陷就是这里全成了 `local:` 派生值，导致歌词静默命中 0 首。
     for (final e in result.successes) {
-      expect(e.songMid, isNotEmpty, reason: '「${e.song.title}」没带回 songMid');
-      expect(e.songMid, isNot(startsWith('local:')),
+      expect(e.sourceId, isNotEmpty, reason: '「${e.song.title}」没带回 songMid');
+      expect(e.sourceId, isNot(startsWith('local:')),
           reason: '「${e.song.title}」带回的是派生 mid，歌词将无法获取');
     }
 
@@ -145,10 +150,12 @@ void main() {
     final limiter = RateLimiter(maxRequests: 30, window: const Duration(minutes: 1));
     final client = BiliApiClient(rateLimiter: limiter);
     final api = BiliApi(client);
+    final biliAdapter = BiliAudioSourceAdapter(api);
 
     final resolver = SourceResolver(
       videos: db.videos,
-      api: api.fetchAudioStream,
+      api: biliAdapter.fetchAudioStream,
+      sourceHeaders: biliAdapter.requiredHeaders,
       repo: repo,
     );
 
@@ -168,7 +175,7 @@ void main() {
     expect(r2.fromCache, isTrue, reason: 'URL 应已落库，第二次不该重新拉流');
 
     // 落库校验
-    final row = await db.videos.getByBvid(r.bvid);
+    final row = await db.videos.getByBvid(r.sourceKey);
     expect(row, isNotNull);
     expect(row!.audioUrl, isNotNull);
     expect(row.audioUrlExpireAt, greaterThan(

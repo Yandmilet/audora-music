@@ -54,24 +54,30 @@ class SongDao {
       for (final r in rows) {
         await executor.rawInsert('''
 INSERT INTO ${Tables.song}
-  (qq_song_mid, title, artists, album, album_mid, lyricist, composer,
-   arranger, genre, release_date, duration_ms, cover_seed, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  (qq_song_mid, meta_source_type, meta_source_id,
+   title, artists, album, album_mid, lyricist, composer,
+   arranger, genre, release_date, duration_ms, cover_seed,
+   lyric_offset_ms, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(qq_song_mid) DO UPDATE SET
-  title = excluded.title,
-  artists = excluded.artists,
-  album = excluded.album,
-  album_mid = excluded.album_mid,
-  lyricist = excluded.lyricist,
-  composer = excluded.composer,
-  arranger = excluded.arranger,
-  genre = excluded.genre,
-  release_date = excluded.release_date,
-  duration_ms = excluded.duration_ms,
-  cover_seed = excluded.cover_seed,
-  updated_at = excluded.updated_at
+  meta_source_type = excluded.meta_source_type,
+  meta_source_id   = excluded.meta_source_id,
+  title            = excluded.title,
+  artists          = excluded.artists,
+  album            = excluded.album,
+  album_mid        = excluded.album_mid,
+  lyricist         = excluded.lyricist,
+  composer         = excluded.composer,
+  arranger         = excluded.arranger,
+  genre            = excluded.genre,
+  release_date     = excluded.release_date,
+  duration_ms      = excluded.duration_ms,
+  cover_seed       = excluded.cover_seed,
+  updated_at       = excluded.updated_at
 ''', [
           r.qqSongMid,
+          r.metaSourceType,
+          r.metaSourceId.isEmpty ? r.qqSongMid : r.metaSourceId,
           r.title,
           r.artists,
           r.album,
@@ -83,6 +89,9 @@ ON CONFLICT(qq_song_mid) DO UPDATE SET
           r.releaseDate,
           r.durationMs,
           r.coverSeed,
+          // lyric_offset_ms 仅在首次插入时写入；冲突时保留库中原值，
+          // 避免批量导入把用户手动校准的偏移静默覆盖
+          r.lyricOffsetMs,
           r.createdAt,
           r.updatedAt,
         ]);
@@ -189,5 +198,21 @@ ON CONFLICT(qq_song_mid) DO UPDATE SET
 
   Future<void> delete(int id) async {
     await db.delete(Tables.song, where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// 定向更新歌词校准偏移（毫秒）。
+  ///
+  /// 只改 lyric_offset_ms 一列，不触发整行 upsert（避免覆盖其他字段）。
+  /// 由 AppState.adjustLyricOffset / resetLyricOffset 调用。
+  Future<void> updateLyricOffset(int songId, int offsetMs) async {
+    await db.update(
+      Tables.song,
+      {
+        'lyric_offset_ms': offsetMs,
+        'updated_at': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+      },
+      where: 'id = ?',
+      whereArgs: [songId],
+    );
   }
 }

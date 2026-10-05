@@ -19,10 +19,9 @@ import '../../services/lyric/lrc_parser.dart';
 import '../../services/lyric/lyric_translation.dart';
 import '../../services/match/match_config.dart';
 import '../../services/match/match_engine.dart';
+import '../../services/metadata/metadata_provider.dart';
 import '../../services/net/rate_limiter.dart' show mapWithConcurrency;
 import '../../services/netease/netease_provider.dart';
-import '../../services/qqmusic/qqmusic_dto.dart';
-import '../../services/qqmusic/qqmusic_provider.dart';
 import '../db/app_database.dart';
 import '../db/dao/binding_dao.dart';
 import '../db/dao/video_dao.dart';
@@ -110,8 +109,14 @@ class OnlineSong {
   /// QQ音乐真实 songMid。入库的唯一凭据。
   final String songMid;
 
-  /// 专辑 mid，用于拼封面 URL
+  /// 专辑 mid，用于拼封面 URL + 专辑详情跳转
   final String albumMid;
+
+  /// 首位歌手 mid，用于入库后播放页点击歌手名进详情
+  final String singerMid;
+
+  /// 首位歌手数字 ID（fetchSingerAlbums 必需）
+  final int? singerId;
 
   /// 是否已经在本地曲库里了。
   ///
@@ -123,6 +128,8 @@ class OnlineSong {
     required this.song,
     required this.songMid,
     this.albumMid = '',
+    this.singerMid = '',
+    this.singerId,
     this.inLibrary = false,
   });
 }
@@ -150,13 +157,18 @@ class LibraryRepository {
   LibraryRepository({
     required this.db,
     required this.engine,
-    required this.qq,
+    required this.metadata,
     this.netease,
   });
 
   final AppDatabase db;
   final MatchEngine engine;
-  final QQMusicProvider qq;
+
+  /// 元数据 Provider（搜索 / 详情 / 歌词 / 批量解析）。
+  ///
+  /// 当前注入的是 [QQMusicMetadataAdapter] 包装后的 QQMusicProvider；
+  /// 未来换网易云 / Spotify / 本地音乐库时只换 Adapter，这里其他代码不动。
+  final MetadataProvider metadata;
 
   /// 译文补充源。**可选**：不注入就只显示原文，功能降级但不报错。
   final NeteaseProvider? netease;
@@ -170,7 +182,7 @@ class LibraryRepository {
   /// 返回 [BatchResolveResult]，失败的项连原因一起带回。
   ///
   /// ## 去重键的取值顺序
-  /// 1. **QQ音乐真实 `songMid`**（`ResolvedEntry.songMid`）—— 首选。
+  /// 1. **QQ音乐真实 `songMid`**（`ResolvedEntry.sourceId`）—— 首选。
   ///    歌词接口只认它，落到 `local:` 兜底会让歌词静默失效。
   /// 2. 解析结果里带回来的 `BatchQuery.refId`（调用方自带的稳定标识，如 B站 bvid）。
   /// 3. 都没有时退回 `local:title|artist`。
@@ -183,7 +195,7 @@ class LibraryRepository {
     bool withLyricCredits = true,
     void Function(int done, int total)? onProgress,
   }) async {
-    final result = await qq.resolveBatch(
+    final result = await metadata.resolveBatch(
       queries,
       withLyricCredits: withLyricCredits,
       onProgress: onProgress,
@@ -196,17 +208,18 @@ class LibraryRepository {
     for (final entry in result.successes) {
       final s = entry.song;
       final ref = entry.query.refId;
-      // ⚠️ 顺序不能颠倒：真实 songMid 必须优先于 refId 前缀。
+      // ⚠️ 顺序不能颠倒：真实 sourceId（原 songMid）必须优先于 refId 前缀。
       // 之前这里恒走 `ref:` / `local:` 分支，QQ音乐解析出的真实 mid 被丢弃，
       // 导致 fetchLyric 里 `startsWith('local:')` 直接返回 null —— 歌词命中 0 首。
-      final mid = entry.songMid.isNotEmpty
-          ? entry.songMid
+      final mid = entry.sourceId.isNotEmpty
+          ? entry.sourceId
           : (ref.isNotEmpty ? 'ref:$ref' : SongRow.deriveMid(s.title, s.artist));
       rows.add(SongRow.fromSong(
         s,
         qqSongMid: mid,
-        // 封面 URL 由 albumMid 拼出，一起落库避免每次播放重新查详情
-        albumMid: entry.albumMid,
+        // 封面 URL 由 coverSourceId（原 albumMid）拼出，一起落库避免每次播放重新查详情
+        albumMid: entry.coverSourceId,
+        singerMid: '',
         now: now,
       ));
     }
@@ -224,6 +237,7 @@ class LibraryRepository {
               e.$1,
               qqSongMid: e.$2,
               albumMid: e.$3,
+              singerMid: '',
               now: now,
             ))
         .toList();
@@ -270,7 +284,7 @@ class LibraryRepository {
     final kw = keyword.trim();
     if (kw.isEmpty) return [];
 
-    final metas = await qq.search(kw, pageSize: pageSize);
+    final metas = await metadata.search(kw, pageSize: pageSize);
     if (metas.isEmpty) return [];
 
     // 详情补全 + 本地查重**并发 5** 执行。
@@ -289,7 +303,7 @@ class LibraryRepository {
       var m = meta;
       if (withDetail) {
         try {
-          final detail = await qq.fetchDetail(m);
+          final detail = await metadata.fetchDetail(m);
           if (detail != null) m = detail;
         } catch (_) {
           // 详情失败就退回搜索结果的粗略字段——不能因为一次补全失败
@@ -298,18 +312,33 @@ class LibraryRepository {
       }
 
       final existing =
-          m.songMid.isEmpty ? null : await db.songs.getByMid(m.songMid);
+          m.sourceId.isEmpty ? null : await db.songs.getByMid(m.sourceId);
       done++;
       onProgress?.call(done, metas.length);
 
       return OnlineSong(
-        song: m.toSong(),
-        songMid: m.songMid,
-        albumMid: m.albumMid,
+        song: _metaToSong(m),
+        songMid: m.sourceId,
+        albumMid: m.coverSourceId,
         inLibrary: existing != null,
       );
     });
   }
+
+  /// MetaSong → Song（通用 DTO → 领域模型）
+  ///
+  /// 之前这一步由 QQSongMeta.toSong() 完成。现在接口层统一用 MetaSong，
+  /// Repository 边界做一次字段拷贝 —— 让领域模型保持纯源无关。
+  Song _metaToSong(MetaSong m) => Song(
+        title: m.title,
+        artist: m.artistString,
+        album: m.album,
+        duration: m.durationSec,
+        releaseDate: m.releaseDate,
+        coverUrl: m.coverUrl,
+        // coverSeed 是封面占位渐变索引，搜索预览场景不需要真实封面，默认 0
+        coverSeed: 0,
+      );
 
   /// 把在线搜索选中的条目入库。
   ///
@@ -328,6 +357,8 @@ class LibraryRepository {
               e.song,
               qqSongMid: e.songMid,
               albumMid: e.albumMid,
+              singerMid: e.singerMid,
+              singerId: e.singerId,
               now: now,
             ))
         .toList();
@@ -360,6 +391,8 @@ class LibraryRepository {
               e.song,
               qqSongMid: e.songMid,
               albumMid: e.albumMid,
+              singerMid: e.singerMid,
+              singerId: e.singerId,
               now: now,
             ))
         .toList();
@@ -540,15 +573,18 @@ class LibraryRepository {
 
     final row = await db.songs.getById(id);
     final mid = row?.qqSongMid ?? '';
-    // local: 前缀是手动录入的派生 mid，QQ音乐查不到
+    // local: 前缀是手动录入的派生 mid，元数据源查不到
     if (mid.isEmpty || mid.startsWith('local:')) return null;
 
-    final result = await qq.fetchLyric(mid);
+    final result = await metadata.fetchLyric(mid);
     final lrc = result?.lrc;
     if (lrc == null || lrc.trim().isEmpty) return null;
 
-    var trans = result?.hasTranslation == true ? result!.trans : null;
-    var source = trans != null ? 'qq' : null;
+    var trans = result?.hasTranslation == true ? result!.translation : null;
+    // 步骤 7：从 MetadataProvider.sourceType 取值，而不是 runtimeType 拼字串
+    // 旧写法 '${result?.runtimeType}' 会返回 'MetaLyric'（DTO 类名），
+    // 新约定返回 'qq' / 'netease' 等 sourceType 标识
+    var source = trans != null ? metadata.sourceType : null;
 
     if (trans == null && netease != null) {
       final body = parseLrc(lrc).lines.map((l) => l.text);
@@ -587,10 +623,16 @@ class LibraryRepository {
     // 排除已知失效的 bvid（设计文档 8.3 的自动修复）
     final failed = await db.bindings.getFailedBvids(songId);
 
+    // v0.7 跨歌学习：查询已验证的可信信号
+    final trustedMids = await db.bindings.getActiveUploaderMids();
+    final trustedBvids = await db.bindings.getActiveBvids();
+
     final result = await engine.match(
       song,
       excludeBvids: failed,
       onLog: onLog,
+      trustedUploaderMids: trustedMids,
+      trustedBvids: trustedBvids,
     );
 
     if (!result.hasCandidate) return result;
@@ -859,8 +901,12 @@ class LibraryRepository {
     required int songDurationSec,
   }) =>
       AudioSource(
-        bvid: v.bvid,
-        cid: v.cid,
+        // 步骤 8：AudioSource 内部只持通用字段，bvid/cid 是 getter 委托
+        bvid: v.sourceKey,
+        cid: int.tryParse(v.sourceSubKey) ?? v.cid,
+        sourceType: v.sourceType,
+        sourceKey: v.sourceKey,
+        sourceSubKey: v.sourceSubKey,
         qualityLabel: audioQualityLabel(v.audioQualityId ?? 0),
         qualityId: v.audioQualityId ?? 0,
         matchScore: b.matchScore,
@@ -873,6 +919,11 @@ class LibraryRepository {
   static VideoRow _toVideoRow(VideoCandidate c) => VideoRow(
         bvid: c.bvid,
         cid: c.cid,
+        // 步骤 7：VideoRow 构造填通用列（VideoCandidate 仍用 B站字段，
+        // 在边界做双写映射）
+        sourceType: 'bilibili',
+        sourceKey: c.bvid,
+        sourceSubKey: c.cid > 0 ? c.cid.toString() : '',
         title: c.title,
         author: c.author,
         mid: c.mid,
@@ -911,12 +962,13 @@ class LibraryRepository {
   ///
   /// 返回修正后的 cid；详情不可达 / 视频已失效返回 null。
   /// 自愈是尽力而为：任何异常都吞掉返回 null，让调用方走原有失败文案。
-  Future<int?> refreshSourceCid(String bvid) async {
+  Future<int?> refreshSourceCid(String sourceKey) async {
     try {
-      final detail = await engine.api.fetchVideoDetail(bvid);
-      final cid = detail?.cid ?? 0;
+      final detail = await engine.sourceProvider.fetchSourceDetail(sourceKey);
+      final subKey = detail?.sourceSubKey ?? '';
+      final cid = int.tryParse(subKey) ?? 0;
       if (cid <= 0) return null;
-      await db.videos.updateCid(bvid, cid);
+      await db.videos.updateCid(sourceKey, cid);
       return cid;
     } catch (_) {
       return null;
@@ -942,14 +994,14 @@ class LibraryRepository {
     var v = video;
     if (v.cid <= 0) {
       try {
-        final d = await engine.api.fetchVideoDetail(v.bvid);
+        final d = await engine.sourceProvider.fetchSourceDetail(v.bvid);
         if (d != null) {
           v = v.copyWith(
-            cid: d.cid,
+            cid: int.tryParse(d.sourceSubKey) ?? 0,
             durationSec: d.durationSec,
             title: d.title,
-            author: d.ownerName,
-            typename: d.tname,
+            author: d.uploaderName,
+            typename: d.category,
           );
         }
       } catch (_) {

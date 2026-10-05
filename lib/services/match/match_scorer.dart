@@ -97,7 +97,14 @@ class MatchScorer {
   /// [songDurationSec] <= 0 表示歌曲时长缺失，走降级路径：
   /// 时长维度给中性分、权重归一化、置信度上限压到 REVIEW
   /// （设计文档 10.1：不允许在缺关键物理证据时自动绑定）。
-  static ScoredCandidate score(VideoCandidate video, Song song) {
+  ///
+  /// [trustedUploaderMids]：v0.7 跨歌学习。已被其他歌曲验证过的 UP 主 mid 集合，
+  /// 传入后 S3 维度会给这些 UP 主的候选额外加分。空集 = 不启用跨歌学习。
+  static ScoredCandidate score(
+    VideoCandidate video,
+    Song song, {
+    Set<int> trustedUploaderMids = const {},
+  }) {
     final songMs = song.duration * 1000;
     final hasDuration = songMs > 0;
     final artists = _splitArtists(song.artist);
@@ -107,7 +114,7 @@ class MatchScorer {
     final s2 = hasDuration
         ? _durationScore(video.durationMs, songMs)
         : MatchConfig.durationNeutralScore;
-    final s3 = _uploaderScore(video, song, artists);
+    final s3 = _uploaderScore(video, song, artists, trustedUploaderMids);
     final s4 = _publishScore(video.pubdate, song.releaseDate);
     final s5 = _categoryScore(video, song);
     final s6 = _formatScore(video.title, song);
@@ -128,7 +135,17 @@ class MatchScorer {
     final penalty = VersionDetector.penalty(video.title);
     final total = (rawTotal - penalty).clamp(0.0, 1.0);
 
-    var confidence = grade(total);
+    final detail = ScoreDetail(
+      s1TitleArtist: s1,
+      s2Duration: s2,
+      s3Uploader: s3,
+      s4Publish: s4,
+      s5Category: s5,
+      s6Format: s6,
+      penalty: penalty,
+    );
+
+    var confidence = grade(total, detail);
 
     // 降级：时长缺失时不允许 AUTO
     if (!hasDuration && confidence == MatchConfidence.auto) {
@@ -142,15 +159,7 @@ class MatchScorer {
     return ScoredCandidate(
       video: video,
       total: total,
-      detail: ScoreDetail(
-        s1TitleArtist: s1,
-        s2Duration: s2,
-        s3Uploader: s3,
-        s4Publish: s4,
-        s5Category: s5,
-        s6Format: s6,
-        penalty: penalty,
-      ),
+      detail: detail,
       confidence: confidence,
     );
   }
@@ -277,35 +286,51 @@ class MatchScorer {
     return best;
   }
 
-  // ── 维度二：时长（设计文档 4.6.3）──────────────────────────
+  // ── 维度二：时长（设计文档 4.6.3 + v0.7 混合分档）──────────
 
   /// 唯一的物理硬证据——标题可以乱写，时长骗不了人。
   ///
-  /// ## 设计文档 4.6.3 有一处笔误，这里已修正
-  /// 原文最后一条写的是 `ratio > 1.5 -> 0.00`，其中
-  /// `ratio = diff / songMs`。但**这条永远不可能成立**：
-  /// 时长翻倍时 `diff = songMs`，`ratio` 恰好等于 1.0，而 `diff` 再大
-  /// 也只能让 `ratio` 趋近 1.0 且不超过——1.5 是个够不到的值。
-  /// 单测 `长度翻倍 → 0.00` 抓到过这个 bug（实际返回 0.05）。
+  /// ## v0.7 混合分档（绝对差 + 相对比例保底）
+  /// 原来只用绝对差（diff ≤ 5s → 0.80），对短歌太松：
+  /// 30s 差 5s = 17% 偏差，Stage 2 动态容忍（15% × 30s = 4.5s）已经
+  /// 接近拒绝，但打分还给 0.80。现在先按绝对差分档保留精细度，
+  /// 再用相对比例做降级保底——保证打分和 Stage 2 硬过滤哲学一致。
   ///
-  /// 改为用「视频时长 / 歌曲时长」这个真正的比值来判断，
-  /// 语义才对得上设计文档想要的「长度差 50% 以上」。
+  /// 设计文档 4.6.3 的笔误已在首版修正：用 videoMs/songMs 比值
+  /// 而不是 diff/songMs 判断 50% 长度差（后者永远 ≤ 1.0）。
   static double _durationScore(int videoMs, int songMs) {
     if (songMs <= 0) return MatchConfig.durationNeutralScore;
     final diff = (videoMs - songMs).abs();
 
-    if (diff <= 1500) return 1.00; // 几乎必然同源
-    if (diff <= 3000) return 0.92;
-    if (diff <= 5000) return 0.80; // 片头片尾微差
-    if (diff <= 10000) return 0.55;
-    if (diff <= 20000) return 0.25;
+    // 1) 绝对差分档（保留原始精细度，长歌区仍靠绝对差区分）
+    double base;
+    if (diff <= 1500) {
+      base = 1.00;
+    } else if (diff <= 3000) {
+      base = 0.92;
+    } else if (diff <= 5000) {
+      base = 0.80;
+    } else if (diff <= 10000) {
+      base = 0.55;
+    } else if (diff <= 20000) {
+      base = 0.25;
+    } else {
+      base = 0.05;
+    }
 
-    // 长度差 50% 以上：视频比歌曲长 1.5 倍，或短到只剩 1/1.5
+    // 2) 相对比例保底：短歌的绝对差会被比例降级
+    // 阈值与 Stage 2 动态容忍（15%）对齐
+    final ratio = diff / songMs;
+    if (ratio > 0.35 && base > 0.25) base = 0.25;
+    if (ratio > 0.25 && base > 0.55) base = 0.55;
+    if (ratio > 0.15 && base > 0.80) base = 0.80;
+
+    // 3) 极端比例归零（视频比歌曲长 1.5 倍 / 短到只剩 2/3）
     final longerRatio = videoMs / songMs;
     final shorterRatio = songMs / videoMs;
-    if (longerRatio > 1.5 || shorterRatio > 1.5) return 0.00;
+    if (longerRatio > 1.5 || shorterRatio > 1.5) base = 0.00;
 
-    return 0.05;
+    return base;
   }
 
   // ── 维度三：UP主可信度（设计文档 4.6.4）────────────────────
@@ -314,8 +339,17 @@ class MatchScorer {
     VideoCandidate video,
     Song song,
     List<String> artists,
+    Set<int> trustedUploaderMids,
   ) {
     var score = 0.4; // 基础分
+
+    // v0.7：UP 主已被其他歌曲验证过（跨歌学习信号）
+    // 同一个 UP 主发过正确音源 → 值得更高的初始信任度
+    if (trustedUploaderMids.isNotEmpty &&
+        video.mid > 0 &&
+        trustedUploaderMids.contains(video.mid)) {
+      score += 0.20;
+    }
 
     // UP主名与歌手名高度重合（官方账号 / 官方 MCN）
     final nAuthor = TextNormalizer.normalize(video.author);
@@ -427,8 +461,33 @@ class MatchScorer {
         .toList();
   }
 
-  /// 总分 → 置信度分级（设计文档 4.6.8）
-  static MatchConfidence grade(double total) {
+  /// 总分 → 置信度分级（设计文档 4.6.8 + v0.7 判断维抬升）
+  ///
+  /// ## v0.7 抬升规则：S1 + S2 双高 → 直接 AUTO
+  /// 贯彻「标题+时长做判断，弱信号只做排序」的设计哲学：
+  /// S1≥0.93（标准格式命中或精确包含）且 S2≥0.80（时长差 ≤ 5s）时，
+  /// 正确概率极高。但弱信号（S3/S4/S5/S6）的低分可能把 total 压到
+  /// 0.60~0.70 区间（如 UP 主是普通搬运号、分区标了「生活」），
+  /// 导致本该 AUTO 的候选被推给人工确认。
+  ///
+  /// 抬升触发条件：
+  ///   - S1 ≥ 0.93 且 S2 ≥ 0.80（双硬证据充足）
+  ///   - penalty < 0.15（非翻唱/伴奏/不插电等二次创作；Live 的 0.05 允许抬升）
+  ///
+  /// 不抬升的边界：
+  ///   - 时长缺失时 S2 = 0.5 < 0.80 → 自动不触发
+  ///   - 纯音乐（无歌手）时 S1 上限 0.55 → 无法到 0.93 → 自动不触发
+  ///   - 版本惩罚 ≥ 0.15（翻唱/伴奏）→ 尊重惩罚结果
+  ///   - 抬升后若缺少关键证据（时长缺失），score() 末尾的降级规则仍会压到 REVIEW
+  static MatchConfidence grade(double total, [ScoreDetail? detail]) {
+    // ★ 判断维双高抬升（仅当有 detail 时才可用）
+    if (detail != null &&
+        detail.s1TitleArtist >= 0.93 &&
+        detail.s2Duration >= 0.80 &&
+        detail.penalty < 0.15) {
+      return MatchConfidence.auto;
+    }
+
     if (total >= MatchConfig.autoThreshold) return MatchConfidence.auto;
     if (total >= MatchConfig.reviewThreshold) return MatchConfidence.review;
     return MatchConfidence.rejected;

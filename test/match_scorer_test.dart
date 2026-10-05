@@ -250,5 +250,33 @@ void main() {
       expect(MatchScorer.grade(0.62), MatchConfidence.review);
       expect(MatchScorer.grade(0.50), MatchConfidence.rejected);
     });
+
+    test('动态时长容忍度：短歌收紧、长歌 30s 封顶', () {
+      // 短歌：120s（2min） → 15% = 18s，远小于 30s 上限
+      expect(MatchConfig.durationToleranceFor(120 * 1000), 18 * 1000);
+      // 长歌：360s（6min） → 15% = 54s，但上限 30s
+      expect(MatchConfig.durationToleranceFor(360 * 1000), 30 * 1000);
+      // 边界：200s（3:20）→ 15% = 30s，刚好等于上限
+      expect(MatchConfig.durationToleranceFor(200 * 1000), 30 * 1000);
+      // 极短：60s（1min）→ 15% = 9s
+      expect(MatchConfig.durationToleranceFor(60 * 1000), 9 * 1000);
+      // 零时长：回退到上限（保险）
+      expect(MatchConfig.durationToleranceFor(0), MatchConfig.durationToleranceMaxMs);
+      // 负时长：同零处理
+      expect(MatchConfig.durationToleranceFor(-1000), MatchConfig.durationToleranceMaxMs);
+    });
+
+    test('动态时长容忍度与硬过滤的联合效应', () {
+      // 2min 歌容忍 18s，一首 2:25 的拼接视频（差 25s）应该被 Stage 2 杀掉
+      const songMs = 120 * 1000;
+      final tol = MatchConfig.durationToleranceFor(songMs);
+      const diff = 25 * 1000;
+      expect(diff > tol, isTrue, reason: '2min 歌容忍 18s，25s 差应该被硬过滤');
+
+      // 5min 歌容忍 30s，同样 25s 差应该通过
+      const longSongMs = 300 * 1000;
+      final longTol = MatchConfig.durationToleranceFor(longSongMs);
+      expect(25 * 1000 <= longTol, isTrue, reason: '5min 歌容忍 30s，25s 差应该通过');
+    });
   });
 }

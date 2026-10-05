@@ -16,7 +16,9 @@ import 'package:audora2/data/repository/library_repository.dart';
 import 'package:audora2/services/bilibili/bili_api.dart';
 import 'package:audora2/services/bilibili/bili_api_client.dart';
 import 'package:audora2/services/match/match_engine.dart';
+import 'package:audora2/services/metadata/qqmusic_metadata_adapter.dart';
 import 'package:audora2/services/qqmusic/qqmusic_provider.dart';
+import 'package:audora2/services/source/bili_audio_source_adapter.dart';
 import 'package:audora2/state/app_state.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -90,7 +92,7 @@ void main() {
     });
 
     test('空库不影响目录浏览（qq 可用，浏览与本地曲库解耦）', () async {
-      final st = AppState(repo: _repo(db));
+      final st = AppState(repo: _repo(db), qqCatalog: QQMusicProvider());
       await st.loadLibrary();
 
       // 浏览优先的形态下，目录内容来自远端，与本地曲库是否为空无关。
@@ -148,6 +150,6 @@ void main() {
 /// 构造 Repository。空库路径不会触发网络，但构造需要 engine / qq。
 LibraryRepository _repo(AppDatabase db) => LibraryRepository(
       db: db,
-      engine: MatchEngine(BiliApi(BiliApiClient())),
-      qq: QQMusicProvider(),
+      engine: MatchEngine(BiliAudioSourceAdapter(BiliApi(BiliApiClient()))),
+      metadata: QQMusicMetadataAdapter(QQMusicProvider()),
     );

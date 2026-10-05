@@ -17,6 +17,7 @@ import 'package:audora2/models/models.dart';
 import 'package:audora2/services/bilibili/bili_dto.dart';
 import 'package:audora2/services/bilibili/bili_exception.dart';
 import 'package:audora2/services/playback/source_resolver.dart';
+import 'package:audora2/services/source/audio_source_provider.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
@@ -38,7 +39,7 @@ void main() {
   late int fetchCalls;
 
   /// 假拉流函数返回的值；设成 null 模拟「接口正常但无音频流」
-  AudioStream? nextStream;
+  AudioSourceInfo? nextStream;
 
   /// 如果要让假函数抛异常，设在这里
   Object? nextError;
@@ -61,12 +62,13 @@ void main() {
       videos: db.videos,
       // 注：这里传的是 lambda 而不是 BiliApi 的方法引用，
       // 因为 AudioStreamFetcher 是普通函数类型，签名天然兼容
-      api: (bvid, cid, {qualityCeiling = 0}) async {
+      api: (sourceKey, sourceSubKey, {qualityCeiling = 0}) async {
         fetchCalls++;
         lastCeiling = qualityCeiling;
         if (nextError != null) throw nextError!;
         return nextStream;
       },
+      sourceHeaders: const {},
       // repo 传 null：本组测试只覆盖「拉流 + 缓存」，
       // 需要验证自动重匹配的用例单独构造带 repo 的实例
       repo: null,
@@ -136,9 +138,9 @@ void main() {
     test('URL 已过期 → 重新拉流', () async {
       // 已经过期 1 秒
       await seedVideo(url: 'https://cdn/stale.m4s', expireAt: nowSec() - 1);
-      nextStream = const AudioStream(
-        id: 30280,
-        baseUrl: 'https://cdn/fresh.m4s',
+      nextStream = const AudioSourceInfo(
+        qualityId: 30280,
+        url: 'https://cdn/fresh.m4s',
         bandwidth: 262779,
       );
 
@@ -154,9 +156,9 @@ void main() {
       // 因此剩余不足 300 秒的 URL 会被判为「即将过期」而提前刷新。
       // 这条边界很关键：若不刷新，用户很可能在缓冲过程中就过期了。
       await seedVideo(url: 'https://cdn/almost.m4s', expireAt: nowSec() + 100);
-      nextStream = const AudioStream(
-        id: 30280,
-        baseUrl: 'https://cdn/fresh.m4s',
+      nextStream = const AudioSourceInfo(
+        qualityId: 30280,
+        url: 'https://cdn/fresh.m4s',
         bandwidth: 262779,
       );
 
@@ -168,9 +170,9 @@ void main() {
 
     test('forceRefresh 跳过缓存', () async {
       await seedVideo(url: 'https://cdn/cached.m4s', expireAt: nowSec() + 3600);
-      nextStream = const AudioStream(
-        id: 30280,
-        baseUrl: 'https://cdn/forced.m4s',
+      nextStream = const AudioSourceInfo(
+        qualityId: 30280,
+        url: 'https://cdn/forced.m4s',
         bandwidth: 262779,
       );
 
@@ -184,9 +186,9 @@ void main() {
       // 库里存的是 cid=100 的 URL，但歌现在指向 cid=200
       await seedVideo(bvid: 'BV1test', cid: 100, url: 'https://cdn/p1.m4s',
           expireAt: nowSec() + 3600);
-      nextStream = const AudioStream(
-        id: 30280,
-        baseUrl: 'https://cdn/p2.m4s',
+      nextStream = const AudioSourceInfo(
+        qualityId: 30280,
+        url: 'https://cdn/p2.m4s',
         bandwidth: 262779,
       );
 
@@ -199,9 +201,9 @@ void main() {
 
   group('拉流成功写库', () {
     test('拉流后 URL 与过期时间落库，下次直接命中缓存', () async {
-      nextStream = const AudioStream(
-        id: 30280,
-        baseUrl: 'https://cdn/net.m4s',
+      nextStream = const AudioSourceInfo(
+        qualityId: 30280,
+        url: 'https://cdn/net.m4s',
         bandwidth: 262779,
       );
 
@@ -231,9 +233,9 @@ void main() {
       //
       // 正常「匹配 → 播放」路径上匹配引擎会先 upsert 视频行，所以
       // 这个问题不会暴露；但绕过匹配直接播放（或从备份恢复）就会踩到。
-      nextStream = const AudioStream(
-        id: 30280,
-        baseUrl: 'https://cdn/x.m4s',
+      nextStream = const AudioSourceInfo(
+        qualityId: 30280,
+        url: 'https://cdn/x.m4s',
         bandwidth: 1000,
       );
 
@@ -370,25 +372,26 @@ void main() {
 
       healingResolver = SourceResolver(
         videos: db.videos,
-        api: (bvid, cid, {qualityCeiling = 0}) async {
+        api: (sourceKey, sourceSubKey, {qualityCeiling = 0}) async {
           healFetchCalls++;
-          if (failAll || cid == 0) {
+          if (failAll || int.tryParse(sourceSubKey) == 0) {
             throw const BiliApiException(
               code: -400,
               message: '请求错误',
               endpoint: '/x/player/wbi/playurl',
             );
           }
-          return const AudioStream(
-            id: 30280,
-            baseUrl: 'httpscdn/fixed.m4s',
+          return const AudioSourceInfo(
+            url: 'httpscdn/fixed.m4s',
+            qualityId: 30280,
             bandwidth: 200000,
           );
         },
         repo: null,
-        repairCid: (bvid) async {
+        sourceHeaders: const {},
+        repairSourceSubKey: (sourceKey) async {
           repairCalls++;
-          return repairedCid;
+          return repairedCid?.toString();
         },
       );
     });
@@ -420,7 +423,7 @@ void main() {
       final r = await healingResolver.resolve(songWithCid(0));
 
       expect(r.ok, isTrue, reason: '-400 应触发 cid 自愈并重拉成功');
-      expect(r.cid, 763429091, reason: '返回结果必须带修正后的 cid');
+      expect(int.tryParse(r.sourceSubKey), 763429091, reason: '返回结果必须带修正后的 cid');
       expect(healFetchCalls, 2, reason: '第一次 -400 + 自愈后重试 = 2 次');
       expect(repairCalls, 1);
 
@@ -477,19 +480,19 @@ void main() {
   });
 
   group('请求头', () {
-    test('audioHeaders 必须带 Referer，否则 CDN 直接 403', () {
-      expect(SourceResolver.audioHeaders['Referer'],
-          'https://www.bilibili.com');
-      expect(SourceResolver.audioHeaders.containsKey('User-Agent'), isTrue);
+    test('SourceResolver 必须从 sourceHeaders 参数读请求头，不再硬编码', () {
+      // sourceHeaders 现在是 SourceResolver 的构造参数（每个音源的头不同）
+      // SourceResolver 本身不再有静态 audioHeaders —— B站的头在 BiliAudioSourceAdapter 里
+      expect(resolver.sourceHeaders, isA<Map<String, String>>());
     });
   });
 
   group('音质偏好透传', () {
     /// 造一条可拉流的歌（复用上面的辅助，避免重复样板）
     test('默认不限制：fetcher 收到 ceiling=0', () async {
-      nextStream = const AudioStream(
-        id: 30280,
-        baseUrl: 'https://cdn/audio.m4s',
+      nextStream = const AudioSourceInfo(
+        qualityId: 30280,
+        url: 'https://cdn/audio.m4s',
         bandwidth: 320000,
       );
       final r = await resolver.resolve(songWith());
@@ -499,9 +502,9 @@ void main() {
 
     test('设了上限就透传下去（偏好必须真的到达 fetcher）', () async {
       resolver.qualityCeiling = 30232;
-      nextStream = const AudioStream(
-        id: 30232,
-        baseUrl: 'https://cdn/audio.m4s',
+      nextStream = const AudioSourceInfo(
+        qualityId: 30232,
+        url: 'https://cdn/audio.m4s',
         bandwidth: 160000,
       );
       final r = await resolver.resolve(songWith());
@@ -511,9 +514,9 @@ void main() {
     });
 
     test('偏好可运行时修改，无需重建 Resolver', () async {
-      nextStream = const AudioStream(
-        id: 30280,
-        baseUrl: 'https://cdn/a.m4s',
+      nextStream = const AudioSourceInfo(
+        qualityId: 30280,
+        url: 'https://cdn/a.m4s',
         bandwidth: 320000,
       );
       resolver.qualityCeiling = 30216;
@@ -535,9 +538,9 @@ void main() {
         qualityId: 30280,
       );
       resolver.qualityCeiling = 30216;
-      nextStream = const AudioStream(
-        id: 30216,
-        baseUrl: 'https://cdn/low.m4s',
+      nextStream = const AudioSourceInfo(
+        qualityId: 30216,
+        url: 'https://cdn/low.m4s',
         bandwidth: 64000,
       );
 

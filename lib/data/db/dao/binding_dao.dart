@@ -223,6 +223,37 @@ class BindingDao {
     return rows.map((r) => r['song_id'] as int).toList();
   }
 
+  /// v0.7：取所有已激活音源的 UP 主 mid 集合。
+  ///
+  /// ## 用途：UP 主跨歌学习
+  /// 批量导入专辑/歌手时，已经在其他歌上验证过的 UP 主（发过正确音源）
+  /// 值得更高的初始信任度——同一个 UP 主给同一歌手发的搬运稿大概率是对的。
+  ///
+  /// 从 binding + video JOIN 取 mid（不是 author 名字）：
+  /// 两个 UP 主可能同名，但 mid 唯一。
+  Future<Set<int>> getActiveUploaderMids() async {
+    final rows = await db.rawQuery('''
+      SELECT DISTINCT v.mid FROM ${Tables.binding} b
+      JOIN ${Tables.video} v ON v.bvid = b.bvid
+      WHERE b.is_active = 1 AND v.mid > 0
+    ''');
+    return {for (final r in rows) (r['mid'] as int?) ?? 0};
+  }
+
+  /// v0.7：取所有已激活音源的 bvid 集合。
+  ///
+  /// ## 用途：灰区二次校验
+  /// REVIEW 区间的候选如果是已被激活过的 bvid（不管哪首歌），
+  /// 说明这个音源是可用且被用户确认过的，应直接抬升为 AUTO。
+  Future<Set<String>> getActiveBvids() async {
+    final rows = await db.query(
+      Tables.binding,
+      columns: ['bvid'],
+      where: 'is_active = 1',
+    );
+    return rows.map((r) => r['bvid'] as String).toSet();
+  }
+
   /// 取「**有任何绑定记录**」的歌曲 id 列表。
   ///
   /// 与 [getActiveSongIds] 的区别：这里包含 REVIEW / REJECTED 的候选。

@@ -27,13 +27,36 @@ enum SourceStatus {
   none,
 }
 
-/// 匹配到的 B 站音源
+/// 匹配到的音源。
+///
+/// ## 通用化字段 vs B站专属字段
+/// 步骤 8 起，领域层**只持有通用字段**（sourceType/sourceKey/sourceSubKey）。
+/// bvid/cid 变成 getter 委托（B站专属映射），不再是 final 字段。
+/// 这样彻底消除了「两个渠道来源的值不同步」的风险——只剩一个真相源。
+///
+/// 构造参数仍兼容 bvid/cid（所有旧调用点零改动），内部自动映射到通用字段。
+///
+/// 未来接入 YouTube Music / 网易云音频源时：
+/// - sourceType = 'youtube', sourceKey = videoId, sourceSubKey = ''
+/// - .bvid getter 返回 videoId（因为 'bvid' 这个名字对 YouTube 没意义，
+///   但调用方可能只需要 sourceKey 值，不在意叫什么）
+/// - 新代码一律用 sourceKey/sourceSubKey，别再读 bvid/cid
 class AudioSource {
-  /// 视频 BV 号
-  final String bvid;
+  /// 通用音源类型 —— 'bilibili' / 'youtube' / ...
+  final String sourceType;
 
-  /// 分P的 cid（多P视频必需，(bvid,cid) 为复合键）
-  final int cid;
+  /// 通用音源主键 —— 对 B站 = bvid，对 YouTube = videoId，等等
+  final String sourceKey;
+
+  /// 通用音源子键 —— 对 B站 = cid.toString()（分P定位），
+  /// 对无分P的平台留空字符串
+  final String sourceSubKey;
+
+  /// B站专属主键 —— 委托到 sourceKey
+  String get bvid => sourceKey;
+
+  /// B站专属 cid —— 委托到 sourceSubKey
+  int get cid => int.tryParse(sourceSubKey) ?? 0;
 
   /// 分P标题（多P时用于展示）
   final String? partTitle;
@@ -50,18 +73,21 @@ class AudioSource {
   /// 是否自动通过（AUTO）还是进入人工复核（REVIEW）
   final bool auto;
 
-  /// 时长差值（秒），B站视频时长 - 歌曲时长
+  /// 时长差值（秒），音源视频时长 - 歌曲时长
   final int durationDelta;
 
-  /// UP 主名称
+  /// 上传者名称（B站 = UP主）
   final String uploader;
 
   /// 播放量，用于展示热度
   final int playCount;
 
-  const AudioSource({
-    required this.bvid,
-    required this.cid,
+  AudioSource({
+    required String bvid,
+    required int cid,
+    String? sourceType,
+    String? sourceKey,
+    String? sourceSubKey,
     this.partTitle,
     required this.qualityLabel,
     required this.qualityId,
@@ -70,9 +96,15 @@ class AudioSource {
     required this.durationDelta,
     required this.uploader,
     this.playCount = 0,
-  });
+  })  : sourceType = sourceType ?? 'bilibili',
+        sourceKey = sourceKey ?? bvid,
+        sourceSubKey = sourceSubKey ?? cid.toString();
 
   AudioSource copyWith({
+    String? sourceType,
+    String? sourceKey,
+    String? sourceSubKey,
+    // 兼容旧代码：单独传 bvid/cid 时自动映射到 sourceKey/sourceSubKey
     String? bvid,
     int? cid,
     String? partTitle,
@@ -84,9 +116,17 @@ class AudioSource {
     String? uploader,
     int? playCount,
   }) {
+    final effectiveSourceKey = sourceKey ?? bvid ?? this.sourceKey;
+    final effectiveSourceSubKey = sourceSubKey ??
+        (cid != null ? cid.toString() : this.sourceSubKey);
     return AudioSource(
-      bvid: bvid ?? this.bvid,
-      cid: cid ?? this.cid,
+      // copyWith 同时传 sourceKey/sourceSubKey 和 bvid/cid 时，
+      // 先算好 sourceKey/sourceSubKey 再构造，避免两者不一致
+      sourceType: sourceType ?? this.sourceType,
+      sourceKey: effectiveSourceKey,
+      sourceSubKey: effectiveSourceSubKey,
+      bvid: effectiveSourceKey,
+      cid: int.tryParse(effectiveSourceSubKey) ?? 0,
       partTitle: partTitle ?? this.partTitle,
       qualityLabel: qualityLabel ?? this.qualityLabel,
       qualityId: qualityId ?? this.qualityId,
@@ -143,11 +183,41 @@ class Song {
   /// null（mock 数据、来源不明的歌）时 UI 回退 [coverSeed] 占位渐变。
   final String? coverUrl;
 
+  /// 首位歌手的 QQ 音乐 mid。
+  ///
+  /// 用途：播放页点击歌手名 → 构造 [SingerBrief] → 进入歌手详情页。
+  /// 来源：QQSongMeta.singerMid 透传。本地曲库旧数据（加字段前落库）
+  /// 可能为 null，此时歌手名点击入口仍可显示但会给出友好提示。
+  final String? singerMid;
+
+  /// 首位歌手的数字 ID（fetchSingerAlbums 必需）。
+  ///
+  /// null 时 SingerDetailScreen 降级为只展示「热门歌曲」tab。
+  final int? singerId;
+
+  /// 专辑 mid（用于在歌手详情页专辑列表里定位当前歌曲所在专辑）。
+  ///
+  /// 之前只有 SongRow 有这个字段（用来拼 coverUrl），现在暴露到 Song 模型。
+  final String? albumMid;
+
+  /// 歌词手动校准偏移（毫秒）。
+  ///
+  /// **语义**：正数 = 歌词整体后移（播放位置要再推进一点才到这一句）；
+  /// 负数 = 歌词整体前移。默认 0 表示不偏移。
+  ///
+  /// **存储粒度**：per-song 而非 per-source。同一首歌的不同音源偏移可能不同，
+  /// 但 90% 场景下换音源只需重新校准一次，换来 schema 大幅简化。
+  ///
+  /// **生效位置**：AppState.mappedLyricMs() 把播放器真实位置 × 比例因子
+  /// 后加上这个值，映射到 LRC 时间空间再做行查找。
+  final int lyricOffsetMs;
+
   const Song({
     this.id,
     required this.title,
     required this.artist,
     this.album = '',
+    this.albumMid,
     required this.duration,
     this.lyricist,
     this.composer,
@@ -159,6 +229,9 @@ class Song {
     this.liked = false,
     required this.coverSeed,
     this.coverUrl,
+    this.singerMid,
+    this.singerId,
+    this.lyricOffsetMs = 0,
   });
 
   /// 唯一键：歌名 + 歌手（用于同名异曲消歧）
@@ -169,6 +242,7 @@ class Song {
     String? title,
     String? artist,
     String? album,
+    String? albumMid,
     int? duration,
     String? lyricist,
     String? composer,
@@ -180,12 +254,16 @@ class Song {
     bool? liked,
     int? coverSeed,
     String? coverUrl,
+    String? singerMid,
+    int? singerId,
+    int? lyricOffsetMs,
   }) {
     return Song(
       id: id ?? this.id,
       title: title ?? this.title,
       artist: artist ?? this.artist,
       album: album ?? this.album,
+      albumMid: albumMid ?? this.albumMid,
       duration: duration ?? this.duration,
       lyricist: lyricist ?? this.lyricist,
       composer: composer ?? this.composer,
@@ -197,6 +275,9 @@ class Song {
       liked: liked ?? this.liked,
       coverSeed: coverSeed ?? this.coverSeed,
       coverUrl: coverUrl ?? this.coverUrl,
+      singerMid: singerMid ?? this.singerMid,
+      singerId: singerId ?? this.singerId,
+      lyricOffsetMs: lyricOffsetMs ?? this.lyricOffsetMs,
     );
   }
 

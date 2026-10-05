@@ -628,47 +628,15 @@ class _SongListPage extends StatelessWidget {
               itemCount: songs.length,
               itemBuilder: (c, i) {
                 final s = songs[i];
-                return InkWell(
-                  borderRadius: BorderRadius.circular(Tokens.rSm),
+                return SongRow(
+                  song: s,
+                  leading: CoverArt(seed: s.coverSeed, size: 46, radius: Tokens.rSm),
+                  subtitle: '${s.artist} · ${s.album}',
+                  showDuration: false,
+                  trailing: s.sourceStatus != SourceStatus.ok
+                      ? SourceBadge(status: s.sourceStatus, compact: true)
+                      : null,
                   onTap: () => st.playSong(s, source: songs),
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 7),
-                    child: Row(
-                      children: [
-                        CoverArt(seed: s.coverSeed, size: 46, radius: Tokens.rSm),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(
-                                s.title,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontSize: 13.5,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                '${s.artist} · ${s.album}',
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        if (s.sourceStatus != SourceStatus.ok)
-                          SourceBadge(status: s.sourceStatus, compact: true),
-                      ],
-                    ),
-                  ),
                 );
               },
             ),

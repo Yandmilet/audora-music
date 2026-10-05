@@ -18,8 +18,10 @@ import 'package:audora2/models/models.dart';
 import 'package:audora2/services/bilibili/bili_api.dart';
 import 'package:audora2/services/bilibili/bili_api_client.dart';
 import 'package:audora2/services/match/match_engine.dart';
+import 'package:audora2/services/metadata/qqmusic_metadata_adapter.dart';
 import 'package:audora2/services/qqmusic/qqmusic_dto.dart';
 import 'package:audora2/services/qqmusic/qqmusic_provider.dart';
+import 'package:audora2/services/source/bili_audio_source_adapter.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -54,15 +56,15 @@ void main() {
   });
 
   group('ResolvedEntry', () {
-    test('同时携带 songMid 与 albumMid', () {
+    test('同时携带 sourceId(=QQ songMid) 与 coverSourceId(=QQ albumMid)', () {
       final e = ResolvedEntry(
         query: const BatchQuery(title: '无名的人', artist: '毛不易'),
         song: _song('无名的人', '毛不易', 256),
-        songMid: '004Z8Ihr0JIu5s',
-        albumMid: '002fRO0N4FftzY',
+        sourceId: '004Z8Ihr0JIu5s',
+        coverSourceId: '002fRO0N4FftzY',
       );
-      expect(e.songMid, '004Z8Ihr0JIu5s');
-      expect(e.albumMid, '002fRO0N4FftzY');
+      expect(e.sourceId, '004Z8Ihr0JIu5s');
+      expect(e.coverSourceId, '002fRO0N4FftzY');
       expect(e.toString(), contains('004Z8Ihr0JIu5s'));
     });
   });
@@ -74,12 +76,12 @@ void main() {
           ResolvedEntry(
             query: const BatchQuery(title: 'a', artist: 'b'),
             song: _song('a', 'b', 100),
-            songMid: 'mid1',
+            sourceId: 'mid1',
           ),
           ResolvedEntry(
             query: const BatchQuery(title: 'c', artist: 'd'),
             song: _song('c', 'd', 200),
-            songMid: 'mid2',
+            sourceId: 'mid2',
           ),
         ],
         rejections: const [
@@ -163,7 +165,7 @@ void main() {
       final repo = LibraryRepository(
         db: db,
         engine: _NoopEngine(),
-        qq: _StubQQ(),
+        metadata: QQMusicMetadataAdapter(_StubQQ()),
       );
       expect(await repo.fetchLyric(_song('x', 'y', 1)), isNull);
     });
@@ -176,7 +178,11 @@ void main() {
       ));
 
       final stub = _StubQQ();
-      final repo = LibraryRepository(db: db, engine: _NoopEngine(), qq: stub);
+      final repo = LibraryRepository(
+        db: db,
+        engine: _NoopEngine(),
+        metadata: QQMusicMetadataAdapter(stub),
+      );
       final song = (await db.songs.getById(id))!.toSong();
 
       expect(await repo.fetchLyric(song), isNull);
@@ -193,7 +199,11 @@ void main() {
       ));
 
       final stub = _StubQQ();
-      final repo = LibraryRepository(db: db, engine: _NoopEngine(), qq: stub);
+      final repo = LibraryRepository(
+        db: db,
+        engine: _NoopEngine(),
+        metadata: QQMusicMetadataAdapter(stub),
+      );
       final song = (await db.songs.getById(id))!.toSong();
 
       final bundle = await repo.fetchLyric(song);
@@ -229,7 +239,7 @@ SongRow _row({required String qqSongMid}) => SongRow(
 
 /// 引擎桩：本测试不涉及 B站匹配，但构造需要非空 api。
 class _NoopEngine extends MatchEngine {
-  _NoopEngine() : super(BiliApi(BiliApiClient()));
+  _NoopEngine() : super(BiliAudioSourceAdapter(BiliApi(BiliApiClient())));
 }
 
 /// QQ provider 桩：只统计歌词调用，返回固定 LRC。

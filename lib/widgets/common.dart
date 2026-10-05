@@ -1,8 +1,10 @@
 import 'dart:math';
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
 import '../models/models.dart';
+import '../services/qqmusic/qqmusic_catalog_dto.dart';
 import '../theme.dart';
 
 /// 用渐变 + 几何图形生成封面（原型阶段不依赖网络图片）
@@ -125,6 +127,76 @@ class SourceBadge extends StatelessWidget {
   }
 }
 
+/// 通用网络封面：渐变占位铺底 + 网络图盖在上面（加载中/失败露出占位）。
+///
+/// 「网络图 + 渐变兜底」这个组合在封面 / 歌手头像 / 专辑卡多处重复，
+/// 统一走这里——[SongCover] 是它的 Song 便捷版。
+class CoverImage extends StatelessWidget {
+  final String? url;
+  final int seed;
+  final double size;
+  final double radius;
+
+  const CoverImage({
+    super.key,
+    required this.url,
+    required this.seed,
+    this.size = 38.0,
+    this.radius = Tokens.rSm,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      width: size,
+      height: size,
+      child: Stack(
+        fit: StackFit.expand,
+        children: [
+          // 底层占位（始终铺底，网络图加载中/失败时露出）
+          CoverArt(seed: seed, size: size, radius: radius),
+          if (url != null && url!.isNotEmpty)
+            ClipRRect(
+              borderRadius: BorderRadius.circular(radius),
+              child: CachedNetworkImage(
+                imageUrl: url!,
+                fit: BoxFit.cover,
+                fadeInDuration: Duration.zero,
+                errorWidget: (_, __, ___) => const SizedBox.shrink(),
+                placeholder: (_, __) => const SizedBox.shrink(),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 歌曲封面组件：优先用真实专辑封面（song.coverUrl），失败回退渐变占位。
+///
+/// 统一组件，迷你播放器、播放队列、搜索结果等多处复用。
+/// [size] 和 [radius] 允许调用方定制尺寸和圆角。
+class SongCover extends StatelessWidget {
+  final Song song;
+  final double size;
+  final double radius;
+
+  const SongCover({
+    super.key,
+    required this.song,
+    this.size = 38.0,
+    this.radius = Tokens.rSm,
+  });
+
+  @override
+  Widget build(BuildContext context) => CoverImage(
+        url: song.coverUrl,
+        seed: song.coverSeed,
+        size: size,
+        radius: radius,
+      );
+}
+
 /// 迷你播放条
 class MiniPlayer extends StatelessWidget {
   final Song song;
@@ -174,7 +246,7 @@ class MiniPlayer extends StatelessWidget {
                 padding: const EdgeInsets.fromLTRB(8, 8, 10, 8),
                 child: Row(
                   children: [
-                    CoverArt(seed: song.coverSeed, size: 38, radius: Tokens.rSm),
+                    SongCover(song: song),
                     const SizedBox(width: 10),
                     Expanded(
                       child: Column(
@@ -445,7 +517,7 @@ class SwipeBack extends StatefulWidget {
   final VoidCallback onBack;
   final Widget child;
 
-  /// false 时完全不注册手势识别器。
+  /// false 时完全不注册手势识别器（但**树形状保持不变**，见 [build] 注释）。
   ///
   /// ## 为什么需要门控而不是在回调里判空
   /// 播放页/搜索页打开时，Shell 的 [ExitConfirm]（退出确认）仍在手势
@@ -470,21 +542,46 @@ class SwipeBack extends StatefulWidget {
 class _SwipeBackState extends State<SwipeBack> {
   double _dx = 0;
 
+  void _onDragStart(DragStartDetails _) => _dx = 0;
+
+  void _onDragUpdate(DragUpdateDetails d) => _dx += d.primaryDelta ?? 0;
+
+  void _onDragEnd(DragEndDetails details) {
+    final v = details.primaryVelocity ?? 0;
+    // 只接向右滑（位移 > 0 且速度 > 0）
+    if ((v >= widget.velocityThreshold) || _dx >= widget.threshold) {
+      widget.onBack();
+    }
+    _dx = 0;
+  }
+
+  /// ⚠️ 关键不变量：无论 [SwipeBack.enabled] 取何值，这里返回的**树形状必须
+  /// 完全一致**——外层永远是 `GestureDetector`，只是把三个 drag 回调置空。
+  ///
+  /// ## 为什么不能写 `if (!enabled) return widget.child;`
+  /// 那样 `enabled` 一翻转，这个位置的 widget **类型**就从 `GestureDetector`
+  /// 变成 `widget.child` 的类型（Shell 传进来的是 `Stack`）。类型变了，
+  /// Flutter 无法原地更新 element，只能**卸载并重建整棵子树**。
+  ///
+  /// [ExitConfirm] 包着 Shell 的整个 body（main.dart:581），而它的 `enabled`
+  /// 是 `!playerOpen && !searchOpen`（main.dart:584）——于是**每次开关播放页
+  /// 或搜索页都会重建整层主内容**。真机实测的后果：
+  ///   - `HomeScreen` 的 `DefaultTabController` 被重建为 `initialIndex: 0`，
+  ///     用户从「歌单推荐」进歌单、点歌、进播放页、再逐级右滑返回，
+  ///     最终落在「**歌手库**」而不是回歌单推荐——这就是长期反馈的
+  ///     「返回固定在歌手库」（2026-09-30 逐帧复现并定位）。
+  ///   - 各 tab 的滚动位置、`_RemoteView` 已加载的远端目录数据一并丢失，
+  ///     返回时全部重新联网拉取。
+  ///
+  /// 回调全为 `null` 时 `GestureDetector` 不注册任何识别器，手势竞技场里
+  /// 依然没有它——「enabled=false 时不参与手势」的原意保持不变。
   @override
   Widget build(BuildContext context) {
-    if (!widget.enabled) return widget.child;
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
-      onHorizontalDragStart: (_) => _dx = 0,
-      onHorizontalDragUpdate: (d) => _dx += d.primaryDelta ?? 0,
-      onHorizontalDragEnd: (details) {
-        final v = details.primaryVelocity ?? 0;
-        // 只接向右滑（位移 > 0 且速度 > 0）
-        if ((v >= widget.velocityThreshold) || _dx >= widget.threshold) {
-          widget.onBack();
-        }
-        _dx = 0;
-      },
+      onHorizontalDragStart: widget.enabled ? _onDragStart : null,
+      onHorizontalDragUpdate: widget.enabled ? _onDragUpdate : null,
+      onHorizontalDragEnd: widget.enabled ? _onDragEnd : null,
       child: widget.child,
     );
   }
@@ -550,6 +647,258 @@ class _ExitConfirmState extends State<ExitConfirm> {
       enabled: widget.enabled,
       onBack: _trigger,
       child: widget.child,
+    );
+  }
+}
+
+/// 网格里的专辑卡片（封面 + 专辑名 + 发行日期）。
+///
+/// 歌手详情的专辑 tab 与搜索结果的专辑 tab 共用同一观感——
+/// 之前两处各有一份逐字段相同的私有实现（约 60 行 ×2）。
+class AlbumCard extends StatelessWidget {
+  final AlbumBrief album;
+  final VoidCallback onTap;
+
+  const AlbumCard({super.key, required this.album, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context);
+    final seed = album.mid.hashCode;
+
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(Tokens.rMd),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(Tokens.rMd),
+              child: album.cover.isEmpty
+                  ? CoverArt(seed: seed, size: 200, radius: 0)
+                  : CachedNetworkImage(
+                      imageUrl: album.cover,
+                      fit: BoxFit.cover,
+                      width: double.infinity,
+                      height: double.infinity,
+                      errorWidget: (_, __, ___) =>
+                          CoverArt(seed: seed, size: 200, radius: 0),
+                    ),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            album.name,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontSize: 11.5,
+              fontWeight: FontWeight.w600,
+              height: 1.35,
+            ),
+          ),
+          if (album.releaseDate.isNotEmpty) ...[
+            const SizedBox(height: 2),
+            Text(
+              album.releaseDate,
+              style: TextStyle(
+                fontSize: 10,
+                color: t.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// 分段式 tab 项：文字 + 底部短下划线（激活态品牌色）。
+///
+/// 目录浏览（歌手库 / 歌单 / 榜单）与搜索结果四分类共用——之前两处各有一份
+/// 逐行相同的实现，只差字号、激活下划线宽度和计数徽章三个样式参数。
+class SegmentTabItem extends StatelessWidget {
+  final String label;
+  final bool active;
+  final VoidCallback onTap;
+
+  /// 搜索结果的分类计数（如「单曲 (23)」）。0 = 不显示徽章。
+  final int count;
+  final double activeFontSize;
+  final double fontSize;
+  final double activeUnderlineWidth;
+
+  const SegmentTabItem({
+    super.key,
+    required this.label,
+    required this.active,
+    required this.onTap,
+    this.count = 0,
+    this.activeFontSize = 14,
+    this.fontSize = 12,
+    this.activeUnderlineWidth = 20,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final onVariant = Theme.of(context).colorScheme.onSurfaceVariant;
+    return GestureDetector(
+      onTap: onTap,
+      behavior: HitTestBehavior.opaque,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: active ? activeFontSize : fontSize,
+                  fontWeight: active ? FontWeight.w800 : FontWeight.w600,
+                  color: active ? Tokens.brand : onVariant,
+                ),
+              ),
+              if (count > 0) ...[
+                const SizedBox(width: 4),
+                Text(
+                  '($count)',
+                  style: TextStyle(
+                    fontSize: 10.5,
+                    color: active ? Tokens.brand : onVariant,
+                  ),
+                ),
+              ],
+            ],
+          ),
+          const SizedBox(height: 4),
+          Container(
+            width: active ? activeUnderlineWidth : 12,
+            height: 2.5,
+            decoration: BoxDecoration(
+              color: active ? Tokens.brand : Colors.transparent,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 通用歌曲行：标题 + 副标题，可选序号列 / 封面 / 状态徽章 / 时长。
+///
+/// 榜单与歌手页（序号 + 时长）、搜索结果（封面 + 播放图标）、
+/// 我的页（封面 + 音源徽章）三种观感同源——之前三处各写一份 Row，
+/// 标题（13.5/w600）与副标题（11/次要色）样式完全相同，只是槽位不同。
+class SongRow extends StatelessWidget {
+  final Song song;
+  final VoidCallback onTap;
+
+  /// 榜单序号列（前三名品牌色）。null = 不显示。
+  final int? rank;
+
+  /// 正在播放高亮：传当前播放的 key，命中时标题品牌色。
+  final String? currentKey;
+
+  /// 前置控件（封面等）。null = 紧跟序号列直接排内容。
+  final Widget? leading;
+
+  /// 副标题文本。null = 只显示歌手（song.artist）。
+  final String? subtitle;
+
+  /// 尾部控件（音源徽章 / 播放图标）。null = 按 [showDuration] 显示时长。
+  final Widget? trailing;
+
+  /// trailing 为 null 时是否显示时长列。我的页不显示时长 → false。
+  final bool showDuration;
+
+  const SongRow({
+    super.key,
+    required this.song,
+    required this.onTap,
+    this.rank,
+    this.currentKey,
+    this.leading,
+    this.subtitle,
+    this.trailing,
+    this.showDuration = true,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context);
+    final isCurrent = currentKey == song.key;
+    final top3 = rank != null && rank! <= 3;
+
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(Tokens.rSm),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 8),
+        child: Row(
+          children: [
+            if (rank != null)
+              SizedBox(
+                width: 26,
+                child: Text(
+                  '$rank',
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w800,
+                    color: top3 ? Tokens.brand : t.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            if (leading != null) ...[
+              leading!,
+              const SizedBox(width: 12),
+            ],
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    song.title,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w600,
+                      color: isCurrent ? Tokens.brand : null,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    subtitle ?? song.artist,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: t.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 8),
+            if (trailing != null)
+              trailing!
+            else if (showDuration)
+              Text(
+                song.durationText,
+                style: TextStyle(
+                  fontSize: 10.5,
+                  color: t.colorScheme.onSurfaceVariant,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                ),
+              ),
+          ],
+        ),
+      ),
     );
   }
 }

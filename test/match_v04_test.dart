@@ -47,6 +47,43 @@ void main() {
       expect(VersionDetector.penalty('SECRET LIVE'), 0.05);
       expect(VersionDetector.penalty('secret COVER'), 0.20);
     });
+
+    // ── v0.6 新增模式 ────────────────────────────────────
+
+    test('self cover / 自翻唱 → 0.10（原歌手自己唱自己，惩罚轻）', () {
+      expect(VersionDetector.penalty('周杰伦 - 晴天 self cover'), 0.10);
+      expect(VersionDetector.penalty('周杰伦 - 晴天 self-cover'), 0.10);
+      expect(VersionDetector.penalty('周杰伦 - 晴天 self_cover'), 0.10);
+      expect(VersionDetector.penalty('周杰伦 - 晴天 自翻唱'), 0.10);
+    });
+
+    test('self-cover 连字符不会被普通 cover 误匹配', () {
+      // self-cover 是 0.10，普通 cover 是 0.20
+      expect(VersionDetector.penalty('self cover'), 0.10);
+      expect(VersionDetector.penalty('self-cover'), 0.10);
+      expect(VersionDetector.penalty('self_cover'), 0.10);
+      expect(VersionDetector.penalty('cover song'), 0.20);
+    });
+
+    test('acoustic / unplugged / 不插电 → 0.15', () {
+      expect(VersionDetector.penalty('秘密 Acoustic'), 0.15);
+      expect(VersionDetector.penalty('秘密 Unplugged'), 0.15);
+      expect(VersionDetector.penalty('秘密 不插电版'), 0.15);
+    });
+
+    test('8bit / chiptune → 0.20', () {
+      expect(VersionDetector.penalty('秘密 8bit'), 0.20);
+      expect(VersionDetector.penalty('秘密 chiptune'), 0.20);
+    });
+
+    test('新增模式与已有模式同档时取最高档', () {
+      // 0.20 档的多个词互撞
+      expect(VersionDetector.penalty('8bit remix'), 0.20);
+      // acoustic(0.15) + cover(0.20) → 取 0.20
+      expect(VersionDetector.penalty('acoustic cover'), 0.20);
+      // self cover(0.10) + live(0.05) → 取 0.10
+      expect(VersionDetector.penalty('self cover live'), 0.10);
+    });
   });
 
   group('TitleParser — 设计文档 §4 标题结构解析（备用件）', () {

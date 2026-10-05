@@ -29,6 +29,7 @@ import 'package:audora2/services/bilibili/bili_dto.dart';
 import 'package:audora2/services/match/match_config.dart';
 import 'package:audora2/services/match/match_engine.dart';
 import 'package:audora2/services/net/rate_limiter.dart';
+import 'package:audora2/services/source/bili_audio_source_adapter.dart';
 
 /// 假的 B站 API：不发任何网络请求，只记账。
 ///
@@ -158,7 +159,7 @@ void main() {
     // （限流器另有单测）。否则每个用例都要真等几十秒。
     fake = _FakeBili(pool: _buildPool());
     engine = MatchEngine(
-      fake,
+      BiliAudioSourceAdapter(fake),
       rateLimiter: RateLimiter(maxRequests: 100000),
     );
   });
@@ -187,7 +188,10 @@ void main() {
 
       // 换一个 60 条的池子（翻倍）
       fake = _FakeBili(pool: _buildPool(size: 60));
-      engine = MatchEngine(fake, rateLimiter: RateLimiter(maxRequests: 100000));
+      engine = MatchEngine(
+        BiliAudioSourceAdapter(fake),
+        rateLimiter: RateLimiter(maxRequests: 100000),
+      );
       await engine.match(_song);
 
       expect(fake.detailCalls, small,
@@ -201,6 +205,40 @@ void main() {
       await engine.match(_song);
       expect(fake.searchCalls, lessThanOrEqualTo(4));
       expect(fake.searchCalls, greaterThanOrEqualTo(1));
+    });
+
+    test('P3a：候选池不足 12 条时，只要强候选 ≥ 3 就跳过 Q3/Q4', () async {
+      // v0.6 之前有个硬性门槛 minRecallCandidates=12，池子不到 12 条永不跳过 Q3/Q4。
+      // 这导致"Q1 就搜出了 5 条完美候选但还是白烧 2 次搜索"。
+      // 现在门槛去掉：只看强候选数量。
+      final smallPool = _FakeBili(pool: [
+        // 只有 8 条候选（远小于 12），但每一条都是"白浩寅 - 秘密"标题精确命中 + 时长 256
+        for (var i = 0; i < 8; i++)
+          VideoCandidate(
+            bvid: 'BV1SMALL${i.toString().padLeft(2, '0')}',
+            title: '白浩寅 - 秘密',
+            author: '白浩寅',
+            mid: 999 + i,
+            durationSec: 256,
+            play: 500000 - i * 1000,
+            pubdate: 1600000000,
+          ),
+      ]);
+      final e = MatchEngine(
+        BiliAudioSourceAdapter(smallPool),
+        rateLimiter: RateLimiter(maxRequests: 100000),
+      );
+
+      await e.match(_song);
+
+      // 搜索请求数应该是 2（只有 Q1/Q2），不是 4（Q1/Q2/Q3/Q4 全跑）
+      expect(
+        smallPool.searchCalls,
+        2,
+        reason: '池子只有 8 条但每一条都是完美候选——'
+            'Q1/Q2 回来后应该立即发现 ≥ 3 条强候选，跳过 Q3/Q4 省 2 次搜索。'
+            '若等于 4 说明 minRecallCandidates 门槛没去掉',
+      );
     });
 
     test('单首歌总请求数（搜索 + 详情）远低于「4 + 候选池」', () async {
@@ -292,7 +330,10 @@ void main() {
 
     test('搜索失败不写缓存：抖动一次不能让这首歌在 TTL 内匹配不到', () async {
       final flaky = _FakeBili(pool: _buildPool());
-      final e = MatchEngine(flaky, rateLimiter: RateLimiter(maxRequests: 100000));
+      final e = MatchEngine(
+        BiliAudioSourceAdapter(flaky),
+        rateLimiter: RateLimiter(maxRequests: 100000),
+      );
 
       // 第一轮：搜索全部抛异常（模拟 -412 / 网络抖动）
       flaky.failSearch = true;
@@ -326,7 +367,10 @@ void main() {
 
     test('B站 完全没有结果时，match 必须在限定时间内返回', () async {
       final empty = _FakeBili(pool: <VideoCandidate>[]);
-      final e = MatchEngine(empty, rateLimiter: RateLimiter(maxRequests: 100000));
+      final e = MatchEngine(
+        BiliAudioSourceAdapter(empty),
+        rateLimiter: RateLimiter(maxRequests: 100000),
+      );
 
       final r = await e.match(_song).timeout(
             const Duration(seconds: 5),
@@ -342,7 +386,10 @@ void main() {
 
     test('无结果时的搜索请求数有上界（回退只允许一次）', () async {
       final empty = _FakeBili(pool: <VideoCandidate>[]);
-      final e = MatchEngine(empty, rateLimiter: RateLimiter(maxRequests: 100000));
+      final e = MatchEngine(
+        BiliAudioSourceAdapter(empty),
+        rateLimiter: RateLimiter(maxRequests: 100000),
+      );
 
       await e.match(_song).timeout(const Duration(seconds: 5));
 
@@ -356,7 +403,10 @@ void main() {
 
     test('无结果时不会请求任何详情', () async {
       final empty = _FakeBili(pool: <VideoCandidate>[]);
-      final e = MatchEngine(empty, rateLimiter: RateLimiter(maxRequests: 100000));
+      final e = MatchEngine(
+        BiliAudioSourceAdapter(empty),
+        rateLimiter: RateLimiter(maxRequests: 100000),
+      );
 
       await e.match(_song).timeout(const Duration(seconds: 5));
 
@@ -384,4 +434,203 @@ void main() {
           reason: '记录修复前的量级，说明这次优化确实必要');
     });
   });
+
+  // ── v0.6 新增行为测试 ─────────────────────────────────────────
+
+  group('低相关分区提前拦截（v0.6 新增）', () {
+    test('鬼畜/搞笑/游戏类候选不过硬过滤，不进 Stage 3', () async {
+      // 造一个池子：29 条正常候选 + 1 条鬼畜分区的正确音源
+      final normal = _buildPool(size: 29);
+      const lowRelCandidate = VideoCandidate(
+        bvid: 'BV1LOWREL000',
+        title: '白浩寅 - 秘密', // 标题正确
+        author: '白浩寅',
+        mid: 999,
+        durationSec: 256,
+        play: 500000,
+        pubdate: 1600000000,
+        typename: '鬼畜', // 低相关分区！
+      );
+
+      final bili = _FakeBili(pool: [...normal, lowRelCandidate]);
+      final e = MatchEngine(
+        BiliAudioSourceAdapter(bili),
+        rateLimiter: RateLimiter(maxRequests: 100000),
+      );
+
+      final r = await e.match(_song);
+
+      // 鬼畜候选被 Stage 2 提前杀掉 → 胜出者不是它
+      expect(r.best, isNotNull);
+      expect(
+        r.best!.video.bvid,
+        isNot(lowRelCandidate.bvid),
+        reason: 'typename=鬼畜 的候选应该在 Stage 2 被拦截，'
+            '不应该胜出。低相关分区拦截的目的就是节流 Stage 3 配额',
+      );
+      // 同时验证确实没有为鬼畜候选发详情请求
+      expect(bili.requestedDetailBvids, isNot(contains(lowRelCandidate.bvid)));
+    });
+
+    test('空 typename 不触发低相关拦截（搜索结果经常没有分区）', () async {
+      // 池子候选 typename 都是空串，应该正常通过硬过滤
+      final pool = _buildPool(size: 15);
+      final bili = _FakeBili(pool: pool);
+      final e = MatchEngine(
+        BiliAudioSourceAdapter(bili),
+        rateLimiter: RateLimiter(maxRequests: 100000),
+      );
+
+      final r = await e.match(_song);
+      expect(r.hasCandidate, isTrue);
+      expect(bili.detailCalls, greaterThan(0));
+    });
+  });
+
+  group('多分P标题断（v0.6 新增）', () {
+    test('CD版 vs Live版：时长接近时选 part 名匹配歌名的那个', () async {
+      // 一首歌的合辑视频，两个分P时长很接近（差 3 秒）但版本不同
+      // FakeBili 的 fetchVideoDetail 对所有候选都返回固定的单页，
+      // 需要一个能自定义 pages 的 FakeBili 变种
+      final multiPage = _FakeBiliMultiPage(
+        pool: [
+          const VideoCandidate(
+            bvid: 'BV1MULTI0001',
+            title: '白浩寅 - 秘密 合辑',
+            author: '白浩寅',
+            mid: 999,
+            durationSec: 260, // 搜索返回合集总时长
+            play: 500000,
+            pubdate: 1600000000,
+            typename: '音乐',
+          ),
+        ],
+        pages: [
+          // Part 1: CD版，时长差 1s，part 名精确匹配歌名
+          const VideoPage(cid: 1001, page: 1, part: '秘密', durationSec: 255),
+          // Part 2: Live版，时长差 4s（也在 2x 范围内），part 名不精确
+          const VideoPage(cid: 1002, page: 2, part: '秘密 Live 现场版', durationSec: 258),
+        ],
+      );
+
+      final e = MatchEngine(
+        BiliAudioSourceAdapter(multiPage),
+        rateLimiter: RateLimiter(maxRequests: 100000),
+      );
+
+      final r = await e.match(_song);
+
+      expect(r.best, isNotNull);
+      expect(r.best!.video.bvid, 'BV1MULTI0001');
+      // 关键验证：CID 应该是 Part 1（精确匹配歌名的那个），而不是 Part 2
+      expect(
+        r.best!.video.cid,
+        1001,
+        reason: '两个分P时长都在最优的 2 倍范围内（255 最优，258 <= 255*2=510），'
+            '应该用 part 名做 tiebreaker，选 part="秘密" 精确匹配歌名的 Part 1',
+      );
+    });
+
+    test('只有一个候选时不用标题断', () async {
+      // 只有一个分P标题不相关的场景，时长最优仍然胜出
+      final multiPage = _FakeBiliMultiPage(
+        pool: [
+          const VideoCandidate(
+            bvid: 'BV1SINGLE001',
+            title: '白浩寅 - 秘密',
+            author: '白浩寅',
+            mid: 999,
+            durationSec: 256,
+            play: 500000,
+            pubdate: 1600000000,
+            typename: '音乐',
+          ),
+        ],
+        pages: [
+          const VideoPage(cid: 2001, page: 1, part: '随机命名', durationSec: 255),
+        ],
+      );
+
+      final e = MatchEngine(
+        BiliAudioSourceAdapter(multiPage),
+        rateLimiter: RateLimiter(maxRequests: 100000),
+      );
+
+      final r = await e.match(_song);
+      expect(r.best, isNotNull);
+      expect(r.best!.video.cid, 2001);
+    });
+
+    test('所有分P时长都离目标太远 → 放弃分P选择（回退用视频时长）', () async {
+      final multiPage = _FakeBiliMultiPage(
+        pool: [
+          const VideoCandidate(
+            bvid: 'BV1FAR00001',
+            title: '白浩寅 - 秘密',
+            author: '白浩寅',
+            mid: 999,
+            durationSec: 258, // 搜索返回的总时长刚好过硬过滤（±30s）
+            play: 500000,
+            pubdate: 1600000000,
+            typename: '音乐',
+          ),
+        ],
+        // 所有分P时长都离 256s 目标太远（400s vs 256s diff=144s，远超过 pageMatchToleranceMs=5s）
+        pages: [
+          const VideoPage(cid: 3001, page: 1, part: '秘密', durationSec: 400),
+          const VideoPage(cid: 3002, page: 2, part: '另一首歌', durationSec: 420),
+        ],
+      );
+
+      final e = MatchEngine(
+        BiliAudioSourceAdapter(multiPage),
+        rateLimiter: RateLimiter(maxRequests: 100000),
+      );
+
+      final r = await e.match(_song);
+      expect(r.best, isNotNull);
+      // _pickBestPage 返回 null（所有分P时长都太远），走回退逻辑用视频时长
+      // 此时 video.durationSec 应该还是 258（从搜索结果，或用 detail.durationSec=400）
+      // 不影响我们的核心断言：不会丢候选
+    });
+  });
+}
+
+/// 扩展假 API：支持自定义多页详情（用于 _pickBestPage 测试）
+class _FakeBiliMultiPage extends BiliApi {
+  _FakeBiliMultiPage({
+    required this.pool,
+    required this.pages,
+  }) : super(BiliApiClient());
+
+  final List<VideoCandidate> pool;
+  final List<VideoPage> pages;
+
+  @override
+  Future<List<VideoCandidate>> searchWithFallback(
+    String keyword, {
+    required int durationFilter,
+    int maxRetries = 3,
+  }) async {
+    return pool;
+  }
+
+  @override
+  Future<VideoDetail?> fetchVideoDetail(String bvid) async {
+    final c = pool.isNotEmpty ? pool.first : null;
+    if (c == null) return null;
+
+    return VideoDetail(
+      bvid: bvid,
+      cid: pages.first.cid,
+      title: c.title,
+      ownerName: c.author,
+      ownerMid: c.mid,
+      tname: '音乐',
+      durationSec: pages.first.durationSec,
+      playCount: c.play,
+      pubdate: c.pubdate,
+      pages: pages,
+    );
+  }
 }

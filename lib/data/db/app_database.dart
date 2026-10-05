@@ -70,6 +70,46 @@ class AppDatabase {
             await db.execute(sql);
           }
         }
+        if (oldV < 5) {
+          for (final sql in kMigrateV4ToV5) {
+            try {
+              await db.execute(sql);
+            } catch (e) {
+              // v4→v5 有 6 条 ALTER TABLE ADD COLUMN。
+              // 若测试造"旧库"时用了新版建表语句（已含通用列），
+              // 或某条 ADD COLUMN 已成功但 UPDATE 失败后重跑，
+              // 都会触发 duplicate column name。跳过，不阻塞后续迁移。
+              if (!e.toString().contains('duplicate column name')) rethrow;
+            }
+          }
+        }
+        if (oldV < 6) {
+          for (final sql in kMigrateV5ToV6) {
+            try {
+              await db.execute(sql);
+            } catch (e) {
+              if (!e.toString().contains('duplicate column name')) rethrow;
+            }
+          }
+        }
+        if (oldV < 7) {
+          for (final sql in kMigrateV6ToV7) {
+            try {
+              await db.execute(sql);
+            } catch (e) {
+              if (!e.toString().contains('duplicate column name')) rethrow;
+            }
+          }
+        }
+        if (oldV < 8) {
+          for (final sql in kMigrateV7ToV8) {
+            try {
+              await db.execute(sql);
+            } catch (e) {
+              if (!e.toString().contains('duplicate column name')) rethrow;
+            }
+          }
+        }
       },
     );
 

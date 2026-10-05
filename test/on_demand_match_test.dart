@@ -30,7 +30,9 @@ import 'package:audora2/services/bilibili/bili_api.dart';
 import 'package:audora2/services/bilibili/bili_api_client.dart';
 import 'package:audora2/services/bilibili/bili_dto.dart';
 import 'package:audora2/services/match/match_engine.dart';
+import 'package:audora2/services/metadata/qqmusic_metadata_adapter.dart';
 import 'package:audora2/services/qqmusic/qqmusic_provider.dart';
+import 'package:audora2/services/source/bili_audio_source_adapter.dart';
 import 'package:audora2/state/app_state.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -156,11 +158,11 @@ void main() {
     );
     repo = LibraryRepository(
       db: db,
-      engine: MatchEngine(api),
+      engine: MatchEngine(BiliAudioSourceAdapter(api)),
       // 本文件不会真的取歌词，但 Repository 的构造需要它。
       // 注意 fetchLyric 会先看 qq_song_mid 是否带 `local:` 前缀——
       // 这里派生出来的 mid 正是 `local:`，所以永远不会打到网络上。
-      qq: QQMusicProvider(),
+      metadata: QQMusicMetadataAdapter(QQMusicProvider()),
     );
     st = AppState(repo: repo);
     lastApi = api;

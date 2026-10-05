@@ -31,10 +31,11 @@ import '../services/lyric/lrc_parser.dart';
 import '../services/lyric/lyric_translation.dart';
 import '../services/playback/audio_player_controller.dart';
 import '../services/qqmusic/qqmusic_provider.dart';
+import '../services/qqmusic/qqmusic_dto.dart';
 import '../services/settings/settings_store.dart';
-// PlayStatsDao 只用于引用 countingThresholdMs 常量（播放门限），
-// 逻辑本身封装在 Repository 里，UI 层不直接碰 DAO。
-import '../data/db/dao/play_stats_dao.dart' show PlayStatsDao;
+import 'bili_session.dart';
+import 'online_search.dart';
+import 'play_stats.dart';
 
 /// 曲库加载状态
 enum LibraryLoadState { idle, loading, ready, failed }
@@ -48,27 +49,36 @@ class AppState extends ChangeNotifier {
     AudioPlayerController? player,
     SettingsStore? settings,
 
+    /// 目录浏览专用的 QQMusicProvider（榜单 / 歌手 / 歌单 / 新歌榜）。
+    /// 这些能力不在 MetadataProvider 接口里——未来换元数据源时可能根本没有「榜单」概念，
+    /// 所以 AppState 直接持有原始 QQMusicProvider 实例，而不是从 LibraryRepository.metadata 拿。
+    QQMusicProvider? qqCatalog,
+
     /// B站 Cookie 会话。传入后「扫码登录」拿到的 SESSDATA 可以立刻注入，
     /// 后续所有 B站请求立即用上登录态，不必重启应用。
     BiliCookieSession? biliSession,
   })  : _repo = repo,
         _player = player,
         _settings = settings,
-        _biliSession = biliSession {
+        _qqCatalog = qqCatalog {
     _quality = _settings?.quality ?? QualityPreference.auto;
     // 启动时把详细级偏好同步给日志内核（AppState 是设置的唯一出口）
     _diagVerbose = _settings?.diagVerbose ?? false;
     DiagLog.instance.setVerbose(_diagVerbose);
 
-    // 恢复上次登录态：Cookie 只存在于内存与 SharedPreferences，
-    // 会话对象每次冷启动都是新的，必须在这里重新注入一次。
-    _biliCookie = _settings?.biliCookieHeader ?? '';
-    _biliCookieAt = _settings?.biliCookieAtMs ?? 0;
-    _biliUserName = _settings?.biliUserName ?? '';
-    _biliUserFace = _settings?.biliUserFace ?? '';
-    if (_biliCookie.isNotEmpty) {
-      biliSession?.setUserSession(cookieHeader: _biliCookie);
-    }
+    // 子模块先于一切使用点构造（组合式拆分，见各自文件头）。
+    _bili = BiliSessionBox(
+      session: biliSession,
+      settings: settings,
+      onChange: _notifyIfMounted,
+    );
+    _stats = PlayStatsRecorder(repo: () => _repo);
+    _search = OnlineSearchBox(
+      catalog: () => _qqCatalog,
+      repo: () => _repo,
+      onImported: loadLibrary,
+      onChange: _notifyIfMounted,
+    );
     // 主题模式持久化：不读盘的话每次冷启动都会「默认浅色」，
     // 用户上一程选的深色全丢（2026-09-30 真机反馈）。
     _themeMode = _settings?.themeMode ?? ThemeMode.light;
@@ -104,6 +114,11 @@ class AppState extends ChangeNotifier {
   /// 曲库仓库。为 null 时说明数据层未接入（单测 / 纯 UI 预览），
   /// 此时全部走 mock 数据。
   final LibraryRepository? _repo;
+
+  /// 目录浏览专用的 QQMusicProvider（榜单/歌手/歌单等 QQ 专属能力）。
+  /// 与 [_repo.metadata] 分离——后者只负责 search/fetchDetail/fetchLyric，
+  /// 目录浏览方法（fetchSingers/fetchPlaylists/fetchToplist*）不在 MetadataProvider 接口里。
+  final QQMusicProvider? _qqCatalog;
 
   /// 本机偏好（音质等）。为 null 时用默认值，不读磁盘——单测不必
   /// 为了「不崩」去搭一套 SharedPreferences 假数据。
@@ -209,126 +224,41 @@ class AppState extends ChangeNotifier {
   }
 
   // ---- B站登录态（C1：扫码登录，解锁更高音质与更宽配额）----
+  //
+  // 实现拆在 state/bili_session.dart（P3 组合式拆分，**不是** part 文件）：
+  // Cookie / 昵称头像 / nav 校验是一组自洽的登录态，只依赖 SettingsStore
+  // 与 BiliCookieSession，不碰播放/曲库——这里只保留同名转发，
+  // 让 UI 层与测试的 st.biliXxx 用法完全不变。
 
-  final BiliCookieSession? _biliSession;
+  late final BiliSessionBox _bili;
 
   /// 供扫码登录页复用同一个会话（登录成功后立刻生效）
-  BiliCookieSession? get biliSession => _biliSession;
+  BiliCookieSession? get biliSession => _bili.session;
 
-  /// Cookie 串的内存镜像（含 SESSDATA）。**永不写进日志。**
-  String _biliCookie = '';
-  int _biliCookieAt = 0;
-  String _biliUserName = '';
-
-  /// 头像 URL（nav `face` 字段）。「我的」页资料卡展示用，与昵称同生命周期
-  String _biliUserFace = '';
-
-  /// 后台 nav 校验的结果（null = 还没校验过 / 网络不可达未下结论）
-  bool? _biliSessionValid;
-
-  /// true = 服务端明确说这个凭证已经不认了。
-  ///
-  /// 只对「服务端明确否定」置真：网络不可达时保持「未校验」，
-  /// 否则一趟电梯下来就被判成「登录失效」，用户会白白重扫一次。
-  bool get biliSessionStale => _biliSessionValid == false;
-
-  bool get biliLoggedIn => _biliCookie.isNotEmpty;
-  String get biliUserName => _biliUserName;
-  String get biliUserFace => _biliUserFace;
+  /// true = 服务端明确说这个凭证已经不认了（详见 [BiliSessionBox.stale]）。
+  bool get biliSessionStale => _bili.stale;
+  bool get biliLoggedIn => _bili.loggedIn;
+  String get biliUserName => _bili.userName;
+  String get biliUserFace => _bili.userFace;
 
   /// 剩余天数；未登录返回 null
-  int? get biliCookieDaysLeft {
-    if (_biliCookieAt <= 0) return null;
-    final exp = DateTime.fromMillisecondsSinceEpoch(_biliCookieAt)
-        .add(SettingsStore.biliCookieTtl);
-    final d = exp.difference(DateTime.now()).inDays;
-    return d < 0 ? 0 : d;
-  }
+  int? get biliCookieDaysLeft => _bili.daysLeft;
 
   /// 已过提示有效期 → 界面催「重新扫码」（不强制登出：服务端可能仍认）
-  bool get biliCookieExpired {
-    final left = biliCookieDaysLeft;
-    return left != null && left <= 0;
-  }
+  bool get biliCookieExpired => _bili.expired;
 
   /// 距到期不足 7 天
-  bool get biliCookieExpiringSoon {
-    final left = biliCookieDaysLeft;
-    return left != null && left > 0 && left <= 7;
+  bool get biliCookieExpiringSoon => _bili.expiringSoon;
+
+  /// 子模块状态变化的统一出口：dispose 之后静默忽略
+  /// （等价于原 verify/apply 内联的 mounted 检查）。
+  void _notifyIfMounted() {
+    if (mounted) notifyListeners();
   }
 
-  /// 保存登录态：注入会话 + 落盘。
-  ///
-  /// 成功后顺手用 nav 接口取一次昵称，界面才能显示「已登录为 XXX」——
-  /// nav 本身就带 wbi key，顺带也把签名密钥刷新了。
-  /// 启动后校验一次本地凭证是否还有效。
-  ///
-  /// 「本地存着 SESSDATA」不等于「服务端还认它」——被吊销、换设备、
-  /// 网页端退出登录都会让它悄悄失效。不校验的表现是：界面显示「已登录」，
-  /// 播放却一直拿 132K，用户根本不知道要重扫。
-  ///
-  /// 只对**服务端明确回答**下结论：nav 拿不到（断网/超时）时保留现状。
-  Future<void> verifyBiliSession() async {
-    if (_biliCookie.isEmpty) return;
-    final nav = await _biliSession?.probeNav();
-    if (nav == null || !mounted) return;
-
-    _biliSessionValid = nav['isLogin'] == true;
-    final name = nav['uname']?.toString() ?? '';
-    if (name.isNotEmpty) _biliUserName = name;
-    final face = _httpsFace(nav['face']?.toString() ?? '');
-    if (face.isNotEmpty) _biliUserFace = face;
-    notifyListeners();
-  }
-
-  /// B站部分接口仍回 http 头像域名，Android 默认禁明文流量，统一升级 https
-  static String _httpsFace(String url) =>
-      url.startsWith('http://') ? 'https://${url.substring(7)}' : url;
-
-  Future<void> applyBiliSession(String cookieHeader) async {
-    _biliCookie = cookieHeader;
-    _biliCookieAt = DateTime.now().millisecondsSinceEpoch;
-    _biliUserName = '';
-    _biliUserFace = '';
-    _biliSessionValid = null;
-    _biliSession?.setUserSession(cookieHeader: cookieHeader);
-    notifyListeners();
-    await _settings?.setBiliSession(cookieHeader);
-
-    try {
-      final nav = await _biliSession?.probeNav();
-      final name = nav?['uname']?.toString() ?? '';
-      final face = _httpsFace(nav?['face']?.toString() ?? '');
-      _biliSessionValid = nav == null ? null : nav['isLogin'] == true;
-      if (name.isNotEmpty) _biliUserName = name;
-      if (face.isNotEmpty) _biliUserFace = face;
-      if (mounted &&
-          (name.isNotEmpty || face.isNotEmpty || _biliSessionValid == false)) {
-        notifyListeners();
-      }
-      if (name.isNotEmpty || face.isNotEmpty) {
-        await _settings?.setBiliSession(
-          cookieHeader,
-          userName: name,
-          userFace: face,
-        );
-      }
-    } catch (_) {
-      // 拿不到昵称/头像不影响登录态本身
-    }
-  }
-
-  Future<void> biliLogout() async {
-    _biliCookie = '';
-    _biliCookieAt = 0;
-    _biliUserName = '';
-    _biliUserFace = '';
-    _biliSessionValid = null;
-    // 无参调用 = 清空登录态并作废缓存的匿名指纹，下次请求会重新取
-    _biliSession?.setUserSession();
-    notifyListeners();
-    await _settings?.clearBiliSession();
-  }
+  Future<void> verifyBiliSession() => _bili.verify();
+  Future<void> applyBiliSession(String cookieHeader) => _bili.apply(cookieHeader);
+  Future<void> biliLogout() => _bili.logout();
 
   /// 当前这首歌**实际**在播的音质（B站音质 ID，0 = 还没解析出来）。
   ///
@@ -471,17 +401,6 @@ class AppState extends ChangeNotifier {
   /// Random() 的轻量开销；next 还会主动排除当前 index，防止随机到同一首。
   final Random _rng = Random();
 
-  // ---- 播放统计 ----
-  //
-  // ## 为什么要累计 listened 而不是直接读 position
-  // `position` 是「当前播到第几秒」，用户可以来回拖——把它当收听时长会
-  // 被 seek 污染（拖到 200 秒再拖回去，等于听了 400 秒）。
-  // 这里按位置流的**增量**累加，且只在「递增且步长合理」时算，
-  // 把拖动导致的大跳变过滤掉。
-  int? _listeningSongId;
-  int _listenedMs = 0;
-  int _lastPosMs = 0;
-
   // ---- 曲库 ----
   List<Song> _library = const [];
 
@@ -518,23 +437,9 @@ class AppState extends ChangeNotifier {
 
   // ---- 搜索 ----
   bool _searchOpen = false;
-  String _query = '';
-  // 搜索历史：数据层未接入时用 mock 的示例词，真实运行时从空开始
-  final List<String> _history = [];
-
-  // ---- 在线搜索（QQ音乐）----
-  /// 在线结果。空 = 还没搜过或搜完无结果（用 [_onlineSearched] 区分）
-  List<OnlineSong> _onlineResults = const [];
-  bool _onlineSearching = false;
-  bool _onlineSearched = false;
-  String? _onlineError;
-
-  /// 在线搜索的请求序号（竞态防护）。
-  ///
-  /// 搜索请求在途时用户可以再按一次回车（关键词已改），两个请求并发
-  /// 在途——慢的旧请求若后返回，会把新结果覆盖成旧词的结果。
-  /// 每次发起搜索自增，返回时序号不是最新即丢弃。
-  int _onlineSearchSeq = 0;
+  /// 在线搜索子模块（关键词 / 历史 / 四分类结果 / 竞态防护 / 导入进度）。
+  /// 实现拆在 state/online_search.dart（P3 组合式拆分），这里只做同名转发。
+  late final OnlineSearchBox _search;
 
   // ---- getters ----
 
@@ -570,21 +475,28 @@ class AppState extends ChangeNotifier {
   int get playerTab => _playerTab;
   int get lyricLine => _lyricLine;
   bool get searchOpen => _searchOpen;
-  String get query => _query;
-  List<String> get history => List.unmodifiable(_history);
+  String get query => _search.query;
+  List<String> get history => List.unmodifiable(_search.history);
   Duration? get sleepTimer => _sleepTimer;
 
-  /// 在线搜索结果（QQ音乐）。带真实 songMid，可直接入库。
-  List<OnlineSong> get onlineResults => _onlineResults;
+  /// 综合搜索结果（四分类聚合结构）。
+  QQSearchResults get searchResults => _search.results;
+
+  /// 在线搜索结果（歌曲 tab 用，带真实 songMid）。
+  ///
+  /// 从 [searchResults.songs] 转换为 OnlineSong——保留这个 getter 是为了
+  /// 兼容既有代码路径。歌手 / 专辑 / 歌单分类请直接用
+  /// `searchResults.singers` 等。
+  List<OnlineSong> get onlineResults => _search.onlineResults;
 
   /// 在线搜索是否进行中
-  bool get onlineSearching => _onlineSearching;
+  bool get onlineSearching => _search.searching;
 
   /// 是否已经完成过一次在线搜索（用于区分「还没搜」和「搜了没结果」）
-  bool get onlineSearched => _onlineSearched;
+  bool get onlineSearched => _search.searched;
 
   /// 在线搜索的错误信息（网络 / 风控等），null 表示无错
-  String? get onlineError => _onlineError;
+  String? get onlineError => _search.error;
 
   /// 在线搜索是否可用：数据层未接入（单测/预览）时没有 QQ 接口，不可用
   bool get canSearchOnline => _repo != null;
@@ -981,8 +893,7 @@ class AppState extends ChangeNotifier {
   // ---- 导入曲库 ----
 
   /// 导入状态文案（导入中显示，导入完成后保留结果供用户查看）
-  String? get importMessage => _importMessage;
-  String? _importMessage;
+  String? get importMessage => _search.importMessage;
 
   // ---- 全局轻提示（toast） ----
 
@@ -1010,8 +921,7 @@ class AppState extends ChangeNotifier {
     });
   }
 
-  bool get importing => _importing;
-  bool _importing = false;
+  bool get importing => _search.importing;
 
   /// 是否有次级路由压在外壳之上（目录子页、歌曲列表页等 Navigator push 的页）。
   ///
@@ -1084,7 +994,7 @@ class AppState extends ChangeNotifier {
 
   /// 正在按需匹配音源的歌名（非空 = 「这首没有音源，正在现匹配」）。
   ///
-  /// ## 为什么单独一个字段而不用 [_importMessage]
+  /// ## 为什么单独一个字段而不用 [OnlineSearchBox.importMessage]
   /// 它要驱动**全局状态条**。首次播放一首没匹配的歌要等约 20 秒，
   /// 用户往往已经切到别的 tab 去干别的了——只有全局可见的反馈
   /// 才能解释「为什么点了播放没马上出声」。
@@ -1162,7 +1072,7 @@ class AppState extends ChangeNotifier {
       _position = d.inSeconds;
       // 累计本次「实际听了多久」。用它而不是「点了多少次」来计播放次数——
       // 点开又秒切不该算听过（见 PlayStatsDao.countingThresholdMs）。
-      _accumulateListened(d);
+      _stats.accumulate(d);
       _updateLyricLine();
       // 进度打点（15 秒节流）：用户不暂停、直接划掉应用时没有任何
       // 回调机会，恢复进度只能靠最近一次落盘。SharedPreferences 写入
@@ -1224,6 +1134,47 @@ class AppState extends ChangeNotifier {
     if (s != null) _duration = s.duration;
   }
 
+  /// 把播放器的真实播放位置（毫秒）映射到 **LRC 歌词时间轴空间**，
+  /// 返回一个「应该用这个毫秒值去查歌词行」的 int。
+  ///
+  /// ## 为什么需要这层映射
+  /// B站音源（MV/UP主上传）的音频总长可能与 QQ 音乐元数据时长差几秒：
+  /// - 官方 MV 有 3~15s 片头/片尾 → 真实音频更长
+  /// - UP 主加速/减速/剪辑过 → 真实音频更短
+  /// 直接把真实位置当 LRC 时间查，歌词会整体错位。
+  ///
+  /// ## 两层修正
+  /// 1. **比例因子**（自动）：`scale = lrcTailMs / realDurationMs`
+  ///    把真实音频的时间轴等比例压缩/拉伸，两端对齐 LRC 的起止点。
+  ///    这层能消除 UP 主加速减速导致的整曲等比例错位。
+  /// 2. **用户校准偏移**（手动）：per-song 存 `lyricOffsetMs`。
+  ///    比例映射无法消除片头/片尾这类「只在开头/结尾出问题」的错位，
+  ///    用户手动 ±500ms 即可对齐。
+  ///
+  /// 公式：`mappedMs = (realPosMs × scale).round() + userOffsetMs`
+  ///
+  /// ## 零防护
+  /// - 歌词为空 → 返回真实位置（后续 _updateLyricLine 直接 return，不影响）
+  /// - 音频时长未知（_duration = 0）→ scale = 1.0，等价于纯偏移
+  /// - LRC 只有一行且没有有效 tail → scale = 1.0
+  int get mappedLyricMs {
+    final realPosMs = _position * 1000;
+    final lines = _lyric.lines;
+    if (lines.isEmpty || _duration <= 0) return realPosMs;
+
+    final lrcTailMs = lines.last.time.inMilliseconds;
+    final realTailMs = _duration * 1000;
+
+    // scale = lrc 空间长度 / 真实空间长度
+    // < 1 → 真实音频更长（有片头/片尾）；> 1 → 真实音频更短（被剪辑）
+    final scale =
+        (lrcTailMs > 0 && realTailMs > 0) ? (lrcTailMs / realTailMs) : 1.0;
+
+    final lrcPosMs = (realPosMs * scale).round();
+    final userOffset = current?.lyricOffsetMs ?? 0;
+    return lrcPosMs + userOffset;
+  }
+
   /// 按当前播放位置刷新歌词高亮行。
   ///
   /// 有真实歌词时按时间轴查找；没有时（mock / 纯音乐）退化为按比例分布，
@@ -1234,15 +1185,83 @@ class AppState extends ChangeNotifier {
       _lyricLine = 0;
       return;
     }
+    final mapped = mappedLyricMs;
     var idx = 0;
     for (var i = 0; i < lines.length; i++) {
-      if (lines[i].time.inMilliseconds <= _position * 1000) {
+      if (lines[i].time.inMilliseconds <= mapped) {
         idx = i;
       } else {
         break;
       }
     }
     _lyricLine = idx.clamp(0, lines.length - 1);
+  }
+
+  // ── 歌词手动校准 ──────────────────────────────────────
+  //
+  // 纯比例映射能消除 UP 主加速减速导致的整曲等比例错位，
+  // 但 MV 片头/片尾这类「只在开头/结尾出问题」的错位无法靠比例消掉。
+  // 这里让用户按 ±500ms 微调，存 per-song。
+
+  /// 按 [deltaMs]（可正可负，通常 ±500）调整当前歌的歌词校准偏移。
+  ///
+  /// **语义**：正数 = 歌词整体后移（需要再推进一点播放位置才到这一句）；
+  /// 负数 = 歌词整体前移。
+  ///
+  /// 偏移写入数据库持久化，下次播放同一首歌自动生效。
+  void adjustLyricOffset(int deltaMs) {
+    final cur = current;
+    if (cur == null || _index < 0) return;
+
+    final newOffset = cur.lyricOffsetMs + deltaMs;
+    // 先更新内存中的 current 引用（让 mappedLyricMs 立即读到新值）
+    _queue[_index] = cur.copyWith(lyricOffsetMs: newOffset);
+
+    // 持久化：数据库写入是异步的，不阻塞 UI
+    final repo = _repo;
+    final id = cur.id;
+    if (repo != null && id != null) {
+      unawaited(repo.db.songs.updateLyricOffset(id, newOffset));
+    }
+
+    // 立即重算高亮行（mappedLyricMs 已读到新 offset）
+    _updateLyricLine();
+    notifyListeners();
+  }
+
+  /// 重置当前歌的歌词校准偏移为 0（仅保留自动比例映射）。
+  void resetLyricOffset() {
+    final cur = current;
+    if (cur == null || cur.lyricOffsetMs == 0) return;
+
+    _queue[_index] = cur.copyWith(lyricOffsetMs: 0);
+
+    final repo = _repo;
+    final id = cur.id;
+    if (repo != null && id != null) {
+      unawaited(repo.db.songs.updateLyricOffset(id, 0));
+    }
+
+    _updateLyricLine();
+    notifyListeners();
+  }
+
+  /// 计算给定歌曲的"首次播放时自动预填歌词偏移量"。
+  ///
+  /// 返回 null 表示不需要预填（已有手动校准 / 时长差太小 / 没有音源）。
+  /// 返回具体毫秒数时，是一个**负整数**——
+  /// 视频比歌曲长（durationDelta > 0）说明有片头，歌词要整体后移（offset 为负）
+  /// 才能让 mappedLyricMs 在片头期间返回 < 0（不高亮）、片头结束后才对齐。
+  int? _computeAutoLyricOffset(Song song) {
+    // 已经手动校准过了（非 0），尊重用户选择
+    if (song.lyricOffsetMs != 0) return null;
+    final src = song.source;
+    if (src == null) return null;
+    final deltaSec = src.durationDelta;
+    // 时长差 < 3s 属于正常的平台元数据粒度差异（QQ音乐给的是整秒，
+    // B站视频时长精确到毫秒），不值得预填
+    if (deltaSec.abs() < 3) return null;
+    return -deltaSec * 1000;
   }
 
   /// 标记为正在播放并（在无真实播放器时）启动模拟计时器
@@ -1290,7 +1309,7 @@ class AppState extends ChangeNotifier {
     if (!mounted) return;
     // 暂停时结算收听时长：用户可能暂停很久甚至直接杀进程，
     // 等到切歌才记的话这一段就丢了，「最近播放」会滞后。
-    if (_playing) unawaited(_flushPlayRecord());
+    if (_playing) unawaited(_stats.flush());
     // 无真实播放器时靠本地标记 + 计时器
     if (p == null) {
       _playing = !_playing;
@@ -1380,18 +1399,16 @@ class AppState extends ChangeNotifier {
     unawaited(loadLyricForCurrent());
 
     // 切歌前先把上一首的收听时长结算掉，否则会丢一段。
-    // ⚠️ 必须在 _listeningSongId 被改掉**之前**调，所以放在最前面。
-    unawaited(_flushPlayRecord());
+    // ⚠️ 必须在 _stats.songId 被改掉**之前**调，所以放在最前面。
+    unawaited(_stats.flush());
 
     final p = _player;
     final song = current;
     // 新歌开始，重置本次收听计数
-    _listeningSongId = song?.id;
+    _stats.reset(song?.id);
     // 同步「最新点播目标」：ensurePlayableSource 的在途匹配靠它判断
     // 自己是否已被用户放弃（见字段注释）
     _pendingPlayId = song?.id;
-    _listenedMs = 0;
-    _lastPosMs = 0;
     // 旧歌的真实时长随切歌作废：先清零再回落到新歌的元数据时长，
     // 新源装载完成后由 durationStream 用真实时长覆盖。
     // 不清的话，从切歌到装载完成这段时间总时长还显示上一首的值，
@@ -1466,6 +1483,25 @@ class AppState extends ChangeNotifier {
         return;
       }
       target = fresh;
+    }
+
+    // —— 首次播放自动预填歌词 offset ——
+    // 视频比歌曲长 N 秒（durationDelta > 0）= MV 有 N 秒片头，
+    // 直接用 -durationDelta*1000 预填 userOffset，省掉用户几十次按钮点击。
+    // 只在 offset==0 且 |delta|>3s 时做：已经手动校准过的不覆盖；
+    // delta < 3s 属于正常平台差，不值得预填。
+    final autoSeedMs = _computeAutoLyricOffset(target);
+    if (autoSeedMs != null) {
+      target = _queue[_index].copyWith(lyricOffsetMs: autoSeedMs);
+      // 回写队列里的引用，确保后续 mappedLyricMs 读到新 offset
+      _queue[_index] = target;
+      final repo = _repo;
+      final id = target.id;
+      if (repo != null && id != null) {
+        unawaited(repo.db.songs.updateLyricOffset(id, autoSeedMs));
+      }
+      // 通知 UI 校准条显示新值（offset 从 0 变非 0）
+      notifyListeners();
     }
 
     // 每曲音量：装载前先恢复该曲的记忆音量（见 _restoreTrackVolume 注释）。
@@ -1627,55 +1663,11 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// 按位置流的增量累计本次收听时长（毫秒）。
-  ///
-  /// ## 为什么要过滤大跳变
-  /// 用户拖动进度条时 position 会瞬间跳几秒甚至几分钟。若直接累加差值，
-  /// 一次拖动就能把一首 3 分钟的歌「听」成 300 次。
-  /// 只接受 **0 < 增量 <= 2 秒** 的正常推进，其余视为 seek 或跳变。
-  void _accumulateListened(Duration pos) {
-    final songId = _listeningSongId;
-    if (songId == null) return;
-
-    final ms = pos.inMilliseconds;
-    final delta = ms - _lastPosMs;
-    if (delta > 0 && delta <= 2000) {
-      _listenedMs += delta;
-    }
-    _lastPosMs = ms;
-
-    // 攒够门限就可以结算了，不必等到切歌——
-    // 用户可能一直听同一首不切，等到切歌才记的话「常听」永远不更新。
-    if (_listenedMs >= PlayStatsDao.countingThresholdMs) {
-      final chunk = _listenedMs;
-      _listenedMs = 0;
-      unawaited(_writePlayRecord(songId, chunk));
-    }
-  }
-
-  /// 结算当前这首歌的收听时长（切歌 / 暂停 / 退出时调）
-  Future<void> _flushPlayRecord() async {
-    final songId = _listeningSongId;
-    if (songId == null) return;
-    final ms = _listenedMs;
-    _listenedMs = 0;
-    // 完全没听（<1 秒）不记流水——那是误触或加载失败，记了会污染「最近播放」
-    if (ms < 1000) return;
-    await _writePlayRecord(songId, ms);
-  }
-
-  Future<void> _writePlayRecord(int songId, int ms) async {
-    final repo = _repo;
-    if (repo == null) return;
-    try {
-      await repo.recordPlay(songId, playedMs: ms);
-    } catch (_) {
-      // 统计失败不该影响播放，静默吞掉
-    }
-  }
+  /// 播放统计子模块（实现拆在 state/play_stats.dart，这里只做转发）。
+  late final PlayStatsRecorder _stats;
 
   /// 手动结束本次收听并落库（暂停时调，让「最近播放」及时更新）
-  Future<void> flushPlaybackStats() => _flushPlayRecord();
+  Future<void> flushPlaybackStats() => _stats.flush();
 
   /// 清除播放历史与统计，返回结果文案。
   ///
@@ -1853,7 +1845,10 @@ class AppState extends ChangeNotifier {
   /// 榜单 / 歌手 / 歌单各自的加载、翻页、重试状态互不相同，
   /// 塞进全局 AppState 只会把它撑爆。页面自己持有 Future 状态，
   /// AppState 只负责点歌之后的事（入库 → 队列 → 播放）。
-  QQMusicProvider? get qq => _repo?.qq;
+  /// QQ音乐目录浏览 Provider（榜单 / 歌手 / 歌单 / 新歌榜）。
+  /// 这些能力不在 MetadataProvider 接口里——未来换元数据源时可能根本没有「榜单」概念，
+  /// 所以 AppState 直接持有原始 QQMusicProvider 实例（main.dart 注入 qqCatalog）。
+  QQMusicProvider? get qq => _qqCatalog;
 
   /// 从目录列表（榜单 / 歌手歌曲 / 歌单）点歌播放。
   ///
@@ -1904,129 +1899,36 @@ class AppState extends ChangeNotifier {
 
   void closeSearch() {
     _searchOpen = false;
-    _query = '';
-    _onlineResults = const [];
-    _onlineSearched = false;
-    _onlineError = null;
-    notifyListeners();
-  }
-
-  /// 搜索词只用于驱动「在线搜 QQ 音乐」。
-  ///
-  /// 曲库作为独立概念已删除（QQ 音乐元数据即曲库，音源在播放页匹配），
-  /// 不再有本地库搜索：输入即想搜 QQ 音乐，回车才发请求。
-  void setQuery(String q) {
-    _query = q;
-    notifyListeners();
-  }
-
-  void commitSearch(String q) {
-    if (q.trim().isEmpty) return;
-    _history.remove(q);
-    _history.insert(0, q);
-    if (_history.length > 8) _history.removeLast();
-    _query = q;
-    notifyListeners();
-    // 回车 = 明确意图，这时候才值得花一次远端请求。
-    unawaited(searchOnline(q));
-  }
-
-  void clearHistory() {
-    _history.clear();
+    _search.resetOnClose();
     notifyListeners();
   }
 
   // ── 在线搜索（QQ音乐）──────────────────────────────────────
+  //
+  // 实现拆在 state/online_search.dart（P3 组合式拆分，**不是** part 文件）：
+  // 关键词 / 历史 / 四分类结果 / 竞态防护 / 导入进度是一组自洽状态，
+  // 只依赖 catalog（搜索接口）、repo（导入落库）与两个回调。
+  // 这里保留同名转发，search_screen 的 st.query / st.searchResults 等用法不变。
 
-  /// 手动触发一次在线搜索。
-  ///
-  /// ## 为什么不跟着 [setQuery] 的防抖自动打
-  /// 在线搜索是打远端接口（慢、限流，防抖失效会触发风控 -412）。
-  /// 打字时只更新输入框，用户**明确按下搜索/回车**才打远端。
-  Future<void> searchOnline([String? keyword]) async {
-    final repo = _repo;
-    final kw = (keyword ?? _query).trim();
-    if (repo == null || kw.isEmpty) return;
+  /// 搜索词只用于驱动「在线搜 QQ 音乐」。**不发全局通知**（性能修复）。
+  /// 打字高频路径的完整设计说明见 [OnlineSearchBox.setQuery]。
+  void setQuery(String q) => _search.setQuery(q);
 
-    // 竞态防护：旧请求晚归不能覆盖新请求的结果
-    final seq = ++_onlineSearchSeq;
-    _onlineSearching = true;
-    _onlineError = null;
-    notifyListeners();
+  /// 回车确认：记历史 + 发一次远端请求（竞态防护见 [OnlineSearchBox.search]）。
+  void commitSearch(String q) => _search.commit(q);
 
-    try {
-      final items = await repo.searchOnline(kw);
-      if (seq != _onlineSearchSeq) return;
-      _onlineResults = items;
-      _onlineSearched = true;
-    } catch (e) {
-      if (seq != _onlineSearchSeq) return;
-      _onlineResults = const [];
-      _onlineSearched = true;
-      _onlineError = '$e';
-    } finally {
-      // 只有没有更新搜索在途时才能收掉 searching 态——
-      // 否则新一轮搜索的转圈会被旧请求的 finally 提前关掉
-      if (seq == _onlineSearchSeq) {
-        _onlineSearching = false;
-        notifyListeners();
-      }
-    }
-  }
+  void clearHistory() => _search.clearHistory();
 
-  /// 把在线搜索选中的条目导入曲库。
-  ///
-  /// 导入后必须 [loadLibrary] 刷新——否则用户在「我的」页看到的曲库
-  /// 还是旧的，会以为导入没生效。
-  Future<String> importOnline(List<OnlineSong> items) async {
-    final repo = _repo;
-    if (repo == null) return '数据层未接入';
-    if (items.isEmpty) return '没有选中的歌曲';
+  /// 手动触发一次在线搜索（四分类综合搜索）。
+  Future<void> searchOnline([String? keyword]) => _search.search(keyword);
 
-    _importing = true;
-    _importMessage = '正在导入 ${items.length} 首…';
-    notifyListeners();
-
-    try {
-      final n = await repo.importOnline(items);
-      await loadLibrary();
-      // 导入后这些歌已经从「在线」变成「在库」，刷新预览的 inLibrary 标记，
-      // 让 UI 立刻把按钮切到「已在库中」，不用用户再搜一次
-      _onlineResults = _onlineResults
-          .map((e) => e.inLibrary
-              ? e
-              : OnlineSong(
-                  song: e.song,
-                  songMid: e.songMid,
-                  albumMid: e.albumMid,
-                  inLibrary: items.any((x) => x.songMid == e.songMid),
-                ))
-          .toList();
-
-      // ⚠️ 提示语必须指向**最短路径**。
-      // 点开任意一首就会按需匹配（约 20 秒/首），直接听才是对的。
-      final msg = '已导入 $n 首，点开即自动匹配音源（约 20 秒/首）';
-      _importMessage = msg;
-      return _importMessage!;
-    } catch (e) {
-      _importMessage = '导入失败：$e';
-      return _importMessage!;
-    } finally {
-      _importing = false;
-      notifyListeners();
-    }
-  }
+  /// 把在线搜索选中的条目导入曲库（导入后内部回调 loadLibrary 刷新）。
+  Future<String> importOnline(List<OnlineSong> items) =>
+      _search.importSelected(items);
 
   /// 清空在线搜索结果（关闭搜索页 / 清空输入时）
-  void clearOnlineResults() {
-    if (_onlineResults.isEmpty && !_onlineSearched && _onlineError == null) {
-      return;
-    }
-    _onlineResults = const [];
-    _onlineSearched = false;
-    _onlineError = null;
-    notifyListeners();
-  }
+  void clearOnlineResults() => _search.clearResults();
+
 
   void toggleTheme() {
     _themeMode = isDark ? ThemeMode.light : ThemeMode.dark;

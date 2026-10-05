@@ -49,8 +49,9 @@ class QQMusicProvider {
       'https://shc.y.qq.com/soso/fcgi-bin/search_for_qq_cp';
   static const _fcgUrl = 'https://u.y.qq.com/cgi-bin/musicu.fcg';
 
-  /// 歌手列表（老接口，但目录里**唯一**能用的歌手入口）
-  static const _singerListUrl = 'https://c.y.qq.com/v8/fcg-bin/v8.fcg';
+  /// 专辑歌曲列表接口。这是个旧版 fcgi 接口，不走 musicu.fcg 体系。
+  static const _musicmallUrl =
+      'https://c6.y.qq.com/v8/fcg-bin/musicmall.fcg';
 
   /// 歌单分类列表
   static const _playlistTagUrl =
@@ -65,7 +66,9 @@ class QQMusicProvider {
   };
 
   /// 搜索歌曲。返回按官方相关性排序的候选列表。
-  Future<List<QQSongMeta>> search(String keyword, {int pageSize = 20}) async {
+  ///
+  /// ⚠️ 接口硬上限 30 条 / 页。要更多请用 [searchAll] 翻页循环。
+  Future<List<QQSongMeta>> search(String keyword, {int pageSize = 30}) async {
     if (keyword.trim().isEmpty) return [];
     try {
       final resp = await dio.get<dynamic>(
@@ -73,7 +76,7 @@ class QQMusicProvider {
         queryParameters: {
           'w': keyword,
           'p': 1,
-          'n': pageSize,
+          'n': pageSize.clamp(1, 30),
           'format': 'json',
         },
         options: Options(headers: _headers),
@@ -96,6 +99,65 @@ class QQMusicProvider {
       throw QQMusicApiException(-1, e.message ?? e.type.name,
           endpoint: _searchUrl);
     }
+  }
+
+  /// 综合搜索：返回歌曲 + 从歌曲中提取去重的歌手和专辑。
+  ///
+  /// ## 为什么歌手 / 专辑从歌曲提取
+  /// QQ 音乐没有公开可用的歌手 / 专辑 / 歌单搜索端点
+  /// （music.fcg 的搜索类 module 全部返回 code 500003 风控）。
+  /// 但每条歌曲结果内嵌了完整的 singer[].{mid, name, id} 和
+  /// albummid / albumname——所以「搜索含 X 的歌曲 → 提取出现过的歌手」
+  /// 在语义上等同于「搜索歌手 X」，对用户来说体验一致。
+  ///
+  /// ## [maxPages] 控制总量
+  /// 接口硬上限 30 条 / 页。maxPages 默认 2（60 条歌曲）——
+  /// 再翻页请求量太大且收益递减。60 首的覆盖度已经足够让
+  /// 歌手 / 专辑分类有意义（周杰伦 60 首里有 15+ 个不同专辑）。
+  Future<QQSearchResults> searchAll(
+    String keyword, {
+    int maxPages = 2,
+  }) async {
+    final kw = keyword.trim();
+    if (kw.isEmpty) return const QQSearchResults();
+
+    final allSongs = <QQSongMeta>[];
+
+    for (var page = 1; page <= maxPages; page++) {
+      final resp = await dio.get<dynamic>(
+        _searchUrl,
+        queryParameters: {
+          'w': kw,
+          'p': page,
+          'n': 30,
+          'format': 'json',
+        },
+        options: Options(headers: _headers),
+      );
+      final map = _decode(resp.data, _searchUrl);
+      final data = map['data'] as Map<String, dynamic>?;
+      final song = data?['song'] as Map<String, dynamic>?;
+      if (song == null) break;
+
+      final list = song['list'];
+      if (list is! List || list.isEmpty) break;
+
+      var validInPage = 0;
+      for (final item in list) {
+        if (item is! Map) continue;
+        final meta = QQSongMeta.fromSearchJson(item.cast<String, dynamic>());
+        if (meta.songMid.isEmpty) continue;
+        allSongs.add(meta);
+        validInPage++;
+      }
+
+      // 本页有效数量不足 30 说明已到末尾
+      if (validInPage < 30) break;
+    }
+
+    if (allSongs.isEmpty) return const QQSearchResults();
+
+    return QQSearchResults.fromSongs(allSongs);
   }
 
   /// 拉歌曲详情（精确时长 / 发行日期 / 专辑）。
@@ -358,12 +420,13 @@ class QQMusicProvider {
           withLyricCredits: withLyricCredits,
         );
         if (resolved != null) {
-          // ★ songMid 必须随 Song 一起带回：入库要靠它，否则歌词取不到
+          // ★ sourceId（即 QQ 的 songMid）必须随 Song 一起带回：入库要靠它，
+          // 否则歌词取不到。coverSourceId 即 albumMid（用于拼封面 URL）。
           successes.add(ResolvedEntry(
             query: q,
             song: resolved.$1,
-            songMid: resolved.$2,
-            albumMid: resolved.$3,
+            sourceId: resolved.$2,
+            coverSourceId: resolved.$3,
           ));
         } else {
           const reason = '三重校验全部候选均不通过';
@@ -517,53 +580,165 @@ class QQMusicProvider {
         );
       });
 
-  /// 歌手列表（按热度分页，每页最多 80）。
+  /// 单档歌手列表的一页（原始请求 + 页级缓存）。
   ///
-  /// ## 为什么没有地区筛选
-  /// 接口的 `area`/`key` 参数实测被服务端忽略（见 [kSingerAreaLabels]）。
-  /// 返回的歌手自带地区编码，UI 把它当标签显示。
-  Future<SingerPage> fetchSingers({int page = 1, int pageSize = 80}) =>
-      _cached('singers:$page:$pageSize', () async {
-        final resp = await dio.get<dynamic>(
-          _singerListUrl,
-          queryParameters: {
-            'channel': 'singer',
-            'page': 'list',
-            'key': 'all_all_all',
-            'pagesize': pageSize,
-            'pagenum': page,
-            'format': 'json',
+  /// 返回 `(本页歌手, 该档命中总数)`。
+  ///
+  /// ## 为什么从 [fetchSingers] 里拆出来
+  /// 「华语」档要同时拉内地(`200`) 与港台(`2`) 两条流，而这两条流各自
+  /// 可缓存、可复用——用户从「华语」切到「内地」再切回来不应该重新发请求。
+  /// 缓存粒度放在**单档单页**这一层，合并逻辑才不需要自己管缓存。
+  ///
+  /// ## 两个实测坑（都写在这里，避免下次重新踩）
+  /// 1. **`genre` 必须显式传 `-100`**：省略它不是报错，而是 `code=0`
+  ///    且 `singerlist` 为空数组的**静默空结果**。少传一个字段 = 列表空白，
+  ///    且日志里没有任何异常可查。
+  /// 2. **翻页只认 `sin`**：`sin=80&cur_page=1` 与 `sin=80&cur_page=2`
+  ///    返回的是同一批（第 2 页）。`cur_page` 目前是装饰性的，
+  ///    两个都传是为了跟浏览器行为保持一致，但**偏移量以 `sin` 为准**。
+  /// 3. **越界页不会返回空，而是继续给数据**：`total` 不是分页终点。
+  ///    实测港台 `total=1538`（20 页），第 21 页仍返回 1 条、第 22 页返回
+  ///    整整 80 条；内地 `total=3364`（43 页），第 44 页也返回 80 条。
+  ///    单档时 UI 到不了这些页（`hasMore` 会在 total 处收口），但**多档合并
+  ///    会**——内地 43 页、港台 20 页，合并流第 21 页起港台部分就是这类
+  ///    越界数据。真机上表现为「华语档第 43 页混进 84 条」，其中 80 条是
+  ///    港台的越界尾货。所以这里按 `total` **主动截断**，让合并结果严格
+  ///    等于各档官方命中数之和。
+  Future<(List<SingerBrief>, int)> _fetchSingerPageRaw({
+    required int area,
+    required int sex,
+    required int index,
+    required int page,
+    required int pageSize,
+  }) =>
+      _cached('singers:$area:$sex:$index:$page:$pageSize', () async {
+        final data = await _catalogPost(
+          'Music.SingerListServer',
+          'get_singer_list',
+          {
+            'area': area,
+            'sex': sex,
+            'genre': kSingerAll,
+            'index': index,
+            'sin': (page - 1) * pageSize,
+            'cur_page': page,
           },
-          options: Options(headers: _headers),
         );
-        final map = _decode(resp.data, _singerListUrl);
-        final data = map['data'] as Map<String, dynamic>? ?? const {};
         final total = (data['total'] as num?)?.toInt() ?? 0;
+
+        // 本页起点已经越过该档的命中总数 → 服务端给的是越界数据，丢弃。
+        // 只在 `total > 0` 时判：`total == 0` 既可能是「真的没有」，
+        // 也可能是服务端没给，不该拿它去否决已经拿到的数据。
+        if (total > 0 && (page - 1) * pageSize >= total) {
+          return (const <SingerBrief>[], total);
+        }
+
         final singers = <SingerBrief>[];
-        final raw = data['list'];
+        final raw = data['singerlist'];
         if (raw is List) {
           for (final s in raw) {
             if (s is! Map) continue;
-            final mid = s['Fsinger_mid']?.toString() ?? '';
-            final name = s['Fsinger_name']?.toString() ?? '';
-            if (mid.isEmpty || name.isEmpty) continue;
+            final mid = s['singer_mid']?.toString() ?? '';
+            final rawName = s['singer_name']?.toString() ?? '';
+            if (mid.isEmpty || rawName.isEmpty) continue;
+            final (name, other) = splitSingerName(rawName);
+            final sid = (s['singer_id'] as num?)?.toInt();
             singers.add(SingerBrief(
               mid: mid,
+              singerId: sid,
               name: name,
-              otherName: s['Fother_name']?.toString() ?? '',
-              letter: s['Findex']?.toString() ?? '',
-              // 字段值实测是字符串 "1"，不是数字
-              area: int.tryParse(s['Farea']?.toString() ?? '') ?? 0,
+              otherName: other,
+              pic: normalizeSingerPic(s['singer_pic']?.toString() ?? ''),
+              areaId: area,
             ));
           }
         }
-        return SingerPage(
-          singers: singers,
-          total: total,
-          page: page,
-          totalPage: total <= 0 ? 1 : (total / pageSize).ceil(),
-        );
+        return (singers, total);
       });
+
+  /// 歌手列表（支持地区 / 类型 / 首字母筛选，每页上限 80）。
+  ///
+  /// ## 筛选是服务端真实生效的
+  /// 取值域见 [kSingerAreas] / [kSingerSexes] / [singerIndexId]，三张表都与
+  /// 服务端 `data.tags` 自报的字典逐字对齐。实测组合筛选有效
+  /// （欧美+男+首字母A → 493 人；日本+女 → 461 人）。
+  ///
+  /// ## 多档合并（「华语」= 内地 + 港台）
+  /// [areas] 传多个 id 时，本方法会**并行拉取每一档的第 [page] 页**，再按
+  /// 下标**逐条交错**（内地[0], 港台[0], 内地[1], 港台[1]…）合并成一页。
+  ///
+  /// 为什么是交错而不是「先内地再港台」：服务端各档内部是热度降序
+  /// （内地首条 = 王靖雯不胖，港台首条 = 周杰伦），交错后得到的是一份
+  /// **跨档热度混排**，比「前 3364 条全内地、之后才出现周杰伦」合理得多。
+  /// 这不是精确的全局热度序——服务端不返回热度分，做不到，也不假装做到。
+  ///
+  /// ## `hasMore` 的口径
+  /// 任一档还有下一页就为 `true`。**不能**用 `total / 每页数` 反推总页数：
+  /// 内地 43 页、港台 20 页，合并流在第 21 页后只剩内地还在产出，
+  /// 按总和反推会把内地尾部整段截掉（详见 [SingerPage.hasMore]）。
+  ///
+  /// 传单个 id 时不走合并分支，**原样透传服务端顺序**，零额外开销。
+  Future<SingerPage> fetchSingers({
+    int page = 1,
+    List<int> areas = const [kSingerAll],
+    int sex = kSingerAll,
+    int index = kSingerIndexHot,
+    int pageSize = 80,
+  }) async {
+    final ids = areas.isEmpty ? const [kSingerAll] : areas;
+    final parts = await Future.wait([
+      for (final a in ids)
+        _fetchSingerPageRaw(
+          area: a,
+          sex: sex,
+          index: index,
+          page: page,
+          pageSize: pageSize,
+        ),
+    ]);
+
+    // 单档：直接透传，不做任何重排
+    if (parts.length == 1) {
+      final (singers, total) = parts.first;
+      return SingerPage(
+        singers: singers,
+        total: total,
+        page: page,
+        hasMore: _hasNextPage(singers, total, page, pageSize),
+      );
+    }
+
+    // 多档：按下标逐条交错
+    final merged = <SingerBrief>[];
+    final longest =
+        parts.fold<int>(0, (m, p) => p.$1.length > m ? p.$1.length : m);
+    for (var i = 0; i < longest; i++) {
+      for (final p in parts) {
+        if (i < p.$1.length) merged.add(p.$1[i]);
+      }
+    }
+    return SingerPage(
+      singers: merged,
+      total: parts.fold<int>(0, (s, p) => s + p.$2),
+      page: page,
+      hasMore: parts.any(
+        (p) => _hasNextPage(p.$1, p.$2, page, pageSize),
+      ),
+    );
+  }
+
+  /// 单档是否还有下一页。
+  ///
+  /// 两个条件缺一不可：偏移量还没越过 `total`，**且**本页真的拿到了数据。
+  /// 只判前者的话，服务端若对某档返回空页而 `total` 仍偏大，
+  /// UI 的触底加载会陷入「永远说还有、永远拉不到东西」的死循环。
+  static bool _hasNextPage(
+    List<SingerBrief> got,
+    int total,
+    int page,
+    int pageSize,
+  ) =>
+      got.isNotEmpty && page * pageSize < total;
 
   /// 歌手的歌曲列表（按热度降序）。
   ///
@@ -688,4 +863,136 @@ class QQMusicProvider {
     }
     return map;
   }
+
+  /// 歌手的专辑列表（按时间倒序）。
+  ///
+  /// API: `music.musichallAlbum.AlbumListServer/GetAlbumList`
+  /// ⚠️ 这个接口**只认数字 [singerId]**，不认字符串 mid。
+  /// 传错参数名会被服务端以 `code=104400` 拒掉，且不返回任何有用数据。
+  ///
+  /// 返回结构里 **没有封面字段**，封面需要用 albumMid 拼接：
+  /// `https://y.gtimg.cn/music/photo_new/T002R300x300M000{albumMid}.jpg`
+  Future<List<AlbumBrief>> fetchSingerAlbums(int singerId,
+          {int limit = 50}) =>
+      _cached('singerAlbums:$singerId:$limit', () async {
+        final data = await _catalogPost(
+          'music.musichallAlbum.AlbumListServer',
+          'GetAlbumList',
+          {'singerId': singerId, 'begin': 0, 'num': limit},
+        );
+        final albums = <AlbumBrief>[];
+        final raw = data['albumList'];
+        if (raw is List) {
+          for (final a in raw) {
+            if (a is! Map) continue;
+            final mid = a['albumMid']?.toString() ?? '';
+            if (mid.isEmpty) continue;
+            // 接口不返回封面，用 albumMid 拼接
+            final coverUrl =
+                'https://y.gtimg.cn/music/photo_new/T002R300x300M000$mid.jpg';
+            albums.add(AlbumBrief(
+              mid: mid,
+              name: a['albumName']?.toString() ?? '',
+              cover: coverUrl,
+              singerName: a['singerName']?.toString() ?? '',
+              releaseDate:
+                  a['publishDate']?.toString() ?? a['publicTime']?.toString() ?? '',
+              totalNum: (a['totalNum'] as num?)?.toInt() ?? 0,
+            ));
+          }
+        }
+        return AlbumBrief.sortByDateDesc(albums);
+      });
+
+  /// 专辑详情（歌曲列表）。
+  ///
+  /// 分两步：
+  /// 1. `music.musichallAlbum.AlbumInfoServer/GetAlbumDetail`（musicu.fcg）
+  ///    取专辑元信息 [basicInfo]——但它**不返回歌曲列表**。
+  /// 2. `musicmall.fcg?cmd=get_album_buy_page`（旧版 fcgi）拿歌曲列表。
+  ///
+  /// ⚠️ 之前用 `GetAlbumInfo` 会返回 code=40000，正确方法名是 `GetAlbumDetail`。
+  Future<AlbumDetail> fetchAlbumDetail(String albumMid) =>
+      _cached('albumDetail:$albumMid', () async {
+        // ── 1. 元信息（basicInfo）──
+        String title = '';
+        String cover = '';
+        String singerName = '';
+        String releaseDate = '';
+
+        try {
+          final meta = await _catalogPost(
+            'music.musichallAlbum.AlbumInfoServer',
+            'GetAlbumDetail',
+            {'albummid': albumMid},
+          );
+          final basic = meta['basicInfo'] as Map?;
+          if (basic != null) {
+            title = basic['albumName']?.toString() ?? '';
+            releaseDate = basic['publishDate']?.toString() ?? '';
+            // 封面：basicInfo 里似乎也没有封面字段，用 albumMid 拼接
+            cover =
+                'https://y.gtimg.cn/music/photo_new/T002R300x300M000$albumMid.jpg';
+          }
+          // 歌手名：singer.singerList 数组
+          final singer = meta['singer'];
+          if (singer is Map) {
+            final singerList = singer['singerList'];
+            if (singerList is List) {
+              final names = <String>[];
+              for (final s in singerList) {
+                if (s is Map) {
+                  final n = s['singerName']?.toString() ?? '';
+                  if (n.isNotEmpty) names.add(n);
+                }
+              }
+              singerName = names.join('/');
+            }
+          }
+        } catch (_) {
+          // 元信息接口偶尔会 400，但歌曲列表还能拿到，降级处理
+        }
+
+        // ── 2. 歌曲列表（旧版 musicmall.fcg）──
+        final songs = <QQSongMeta>[];
+        final mallResp = await dio.get<dynamic>(
+          _musicmallUrl,
+          queryParameters: {
+            'cmd': 'get_album_buy_page',
+            'albummid': albumMid,
+            'albumid': 0,
+            'format': 'json',
+            'inCharset': 'utf-8',
+            'outCharset': 'utf-8',
+          },
+          options: Options(headers: _headers),
+        );
+        final mallMap = _decode(mallResp.data, _musicmallUrl);
+        final mallData = mallMap['data'] as Map?;
+        if (mallData != null) {
+          final raw = mallData['songlist'];
+          if (raw is List) {
+            for (final s in raw) {
+              if (s is! Map) continue;
+              final m = QQSongMeta.fromCatalogJson(s.cast<String, dynamic>());
+              if (m.songMid.isNotEmpty) songs.add(m);
+            }
+          }
+        }
+
+        // 兜底：如果没拿到元信息，用专辑封面 URL 兜底
+        if (cover.isEmpty) {
+          cover =
+              'https://y.gtimg.cn/music/photo_new/T002R300x300M000$albumMid.jpg';
+        }
+
+        return AlbumDetail(
+          mid: albumMid,
+          title: title,
+          cover: cover,
+          singerName: singerName,
+          releaseDate: releaseDate,
+          songs: songs,
+        );
+      });
 }
