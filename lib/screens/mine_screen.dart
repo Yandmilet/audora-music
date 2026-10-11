@@ -20,7 +20,7 @@ import 'song_list_page.dart';
 ///
 /// 为什么不用 package_info_plus 动态读：为一行展示文案引入平台插件，
 /// 全部 widget 测试都要跟着 mock，不值当；版本只随发版变。
-const String kAppVersion = '0.1.0';
+const String kAppVersion = '0.2.0';
 
 class MineScreen extends StatelessWidget {
   final AppState st;
