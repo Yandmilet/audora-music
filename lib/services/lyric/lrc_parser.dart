@@ -20,6 +20,8 @@
 ///    这里按时间戳去重（后者丢弃），先保证不重影。
 library;
 
+import 'lyric_word.dart';
+
 /// 一行歌词
 class LyricLine {
   /// 该行开始显示的时间
@@ -34,15 +36,57 @@ class LyricLine {
   /// 再合并一次，反而多出错的机会。
   final String? translation;
 
+  /// 逐字时间轴。空列表 = 这一行没有字级信息，只能整行高亮。
+  ///
+  /// 只存 `charCount`，不存每字文本，见 `lyric_word.dart` 的说明。
+  final List<LyricWord> words;
+
+  /// [words] 是不是「按行时长均分」推算出来的，而不是上游给的真实轴。
+  ///
+  /// UI 用它决定要不要在角落标「近似」。真实轴与均分轴的观感差别很大
+  /// （均分跟不上演唱速度），不能让用户以为是准的。
+  final bool wordsEstimated;
+
+  /// 该行的结束时间，仅上游确实给了才有（TTML 的 `<p end="...">`）。
+  ///
+  /// null 表示未知——LRC 天生只有行首。调用方用「下一行行首」兜底，
+  /// 见 [ParsedLyric.endMsAt]。
+  final Duration? end;
+
   const LyricLine({
     required this.time,
     required this.text,
     this.translation,
+    this.words = const [],
+    this.wordsEstimated = false,
+    this.end,
   });
 
-  /// 返回挂上译文的副本（原对象不可变）
-  LyricLine withTranslation(String t) =>
-      LyricLine(time: time, text: text, translation: t);
+  bool get hasWords => words.isNotEmpty;
+
+  /// 返回挂上译文的副本（原对象不可变）。
+  ///
+  /// ⚠️ 必须把 words/end 一起带过去：挂译文发生在解析**之后**，
+  /// 这里漏一个字段，逐字轴就会被译文流程静默抹掉。
+  LyricLine withTranslation(String t) => LyricLine(
+        time: time,
+        text: text,
+        translation: t,
+        words: words,
+        wordsEstimated: wordsEstimated,
+        end: end,
+      );
+
+  /// 换一份字轴（用于补真实轴 / 均分兜底）。
+  LyricLine withWords(List<LyricWord> newWords, {bool estimated = false}) =>
+      LyricLine(
+        time: time,
+        text: text,
+        translation: translation,
+        words: newWords,
+        wordsEstimated: estimated,
+        end: end,
+      );
 
   @override
   String toString() => '[${time.inMilliseconds}] $text';
@@ -97,6 +141,55 @@ class ParsedLyric {
       }
     }
     return ans;
+  }
+
+  /// 是否有任何一行带逐字轴。决定 UI 走扫光还是老的整行高亮。
+  bool get hasWords => lines.any((l) => l.hasWords);
+
+  /// 逐字轴是不是**全部**推算出来的（没有一条真实轴）。
+  ///
+  /// 三态里只要有一行是真实轴就标 false：真实轴来自整份 TTML，
+  /// 混合只可能出现在人工编辑过的歌词上，那种情况不该整体标「近似」。
+  bool get wordsAllEstimated =>
+      hasWords && lines.every((l) => !l.hasWords || l.wordsEstimated);
+
+  /// 第 [index] 行的结束时间（LRC 时间空间的毫秒）。
+  ///
+  /// 优先用上游给的 [LyricLine.end]；没有就用下一行行首。
+  /// 最后一行没有下一个锚点，[fallbackEndMs] 传音频总时长，
+  /// 拿不到（0）时按演唱速度上限钳一个自然收尾时间，
+  /// 否则末行的扫光会一路跑到歌.end 之外。
+  int endMsAt(int index, {int fallbackEndMs = 0}) {
+    if (index < 0 || index >= lines.length) return fallbackEndMs;
+    final explicit = lines[index].end?.inMilliseconds;
+    final next = index + 1 < lines.length
+        ? lines[index + 1].time.inMilliseconds
+        : null;
+    if (explicit != null) {
+      // 上游 end 可能是脏的（比下一行还晚、或早于行首），钳一下
+      final start = lines[index].time.inMilliseconds;
+      final upper = next ?? (fallbackEndMs > 0 ? fallbackEndMs : explicit);
+      return explicit.clamp(start, upper > start ? upper : start);
+    }
+    if (next != null) return next;
+    if (fallbackEndMs > 0) return fallbackEndMs;
+    return clampEstimatedLineEnd(
+      start: lines[index].time,
+      nextStart: null,
+      charCount: lines[index].text.length,
+    ).inMilliseconds;
+  }
+
+  /// 某时刻这一行唱到哪了。无字轴时返回 [WordFill.none]。
+  WordFill fillAt(int index, Duration position) {
+    if (index < 0 || index >= lines.length) return WordFill.none;
+    final line = lines[index];
+    if (!line.hasWords) return WordFill.none;
+    return fillAtWord(
+      words: line.words,
+      positionMs: position.inMilliseconds,
+      textLength: line.text.length,
+    );
   }
 }
 
@@ -207,4 +300,61 @@ ParsedLyric parsePlainLyric(String raw) {
     i++;
   }
   return ParsedLyric(lines: lines, raw: raw);
+}
+
+/// 给没有字轴的行**按字数均分**补一份近似字轴。
+///
+/// ## 定位：真实轴之外的兜底，不是真实轴的替代
+/// AMLL TTML 命中时用上游给的真实逐字轴（[LyricLine.words] 已填好，
+/// 本函数对它们不做任何改动）；剩下约一半的歌只有逐行 LRC，
+/// 这里按「行时长 ÷ 字数」给每个字分配时间，让扫光至少能跟着走。
+///
+/// ## 幂等
+/// 重复调用结果一致（已有 words 的行直接跳过），所以可以放心地
+/// 在解析链末尾无条件调一次。
+///
+/// ## 行尾时间
+/// 用 [ParsedLyric.endMsAt] 取，其中「没有下一行」的末行按 [totalDurationMs]
+/// 收口；总时长也不知道时按演唱速度钳一个自然收尾，
+/// 避免末行扫光一路跑到歌外。
+ParsedLyric applyWordTiming(ParsedLyric lyric, {int totalDurationMs = 0}) {
+  if (lyric.isEmpty) return lyric;
+
+  final out = <LyricLine>[];
+  for (var i = 0; i < lyric.lines.length; i++) {
+    final line = lyric.lines[i];
+    if (line.hasWords) {
+      out.add(line);
+      continue;
+    }
+    if (line.text.trim().isEmpty) {
+      out.add(line);
+      continue;
+    }
+    final counts = tokenizeCharCounts(line.text);
+    if (counts.isEmpty) {
+      out.add(line);
+      continue;
+    }
+    final startMs = line.time.inMilliseconds;
+    final rawEndMs = lyric.endMsAt(i, fallbackEndMs: totalDurationMs);
+    // 近似轴的行尾还要受「自然演唱速度」钳制：两行之间隔 30 秒时，
+    // 直接按下一行均分会让每个字拖 3 秒，扫光慢得像卡住。
+    final naturalEndMs = clampEstimatedLineEnd(
+      start: line.time,
+      nextStart: Duration(milliseconds: rawEndMs),
+      charCount: counts.fold<int>(0, (a, b) => a + b),
+    ).inMilliseconds;
+    final endMs =
+        naturalEndMs < rawEndMs ? naturalEndMs : rawEndMs;
+    if (endMs <= startMs) {
+      out.add(line);
+      continue;
+    }
+    out.add(line.withWords(
+      estimateWords(charCounts: counts, startMs: startMs, endMs: endMs),
+      estimated: true,
+    ));
+  }
+  return ParsedLyric(lines: out, raw: lyric.raw, instrumental: lyric.instrumental);
 }

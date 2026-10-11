@@ -18,6 +18,7 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 
+import '../data/db/dao/local_audio_dao.dart';
 import '../data/db/rows.dart';
 import '../data/mock_data.dart';
 import '../data/repository/library_repository.dart';
@@ -29,11 +30,16 @@ import '../services/diag/diag_log.dart';
 import '../services/match/match_config.dart' show MatchConfidenceX;
 import '../services/lyric/lrc_parser.dart';
 import '../services/lyric/lyric_translation.dart';
+import '../services/lyric/ttml_lyric_parser.dart';
 import '../services/playback/audio_player_controller.dart';
 import '../services/qqmusic/qqmusic_provider.dart';
 import '../services/qqmusic/qqmusic_dto.dart';
 import '../services/settings/settings_store.dart';
 import 'bili_session.dart';
+import 'download.dart';
+import 'guess_for_you.dart';
+import 'local_library.dart';
+import 'music_dirs.dart';
 import 'online_search.dart';
 import 'play_stats.dart';
 
@@ -61,7 +67,9 @@ class AppState extends ChangeNotifier {
         _player = player,
         _settings = settings,
         _qqCatalog = qqCatalog {
-    _quality = _settings?.quality ?? QualityPreference.auto;
+    _onlineQuality = _settings?.onlineQuality ?? QualityPreference.auto;
+    _downloadQuality =
+        _settings?.downloadQuality ?? QualityPreference.high;
     // 启动时把详细级偏好同步给日志内核（AppState 是设置的唯一出口）
     _diagVerbose = _settings?.diagVerbose ?? false;
     DiagLog.instance.setVerbose(_diagVerbose);
@@ -77,6 +85,60 @@ class AppState extends ChangeNotifier {
       catalog: () => _qqCatalog,
       repo: () => _repo,
       onImported: loadLibrary,
+      onChange: _notifyIfMounted,
+    );
+    _guess = GuessForYouBox(
+      catalog: () => _qqCatalog,
+      topPlayed: () => _topPlayed,
+      liked: () => _library.where(isLiked).toList(),
+      recentlyPlayed: () => _recentlyPlayed,
+      play: playOnline,
+      onChange: _notifyIfMounted,
+      // 与 next(shuffle) 共用一个随机源：省一次 Random() 构造，
+      // 也让「打散推荐」和「随机下一首」在测试里可用同一个 seed 注入。
+      rng: _rng,
+    );
+    _dirs = MusicDirsBox(
+      settings: () => _settings,
+      onChange: _notifyIfMounted,
+    );
+    _local = LocalLibraryBox(
+      repo: () => _repo,
+      // 扫描范围跟着「本地目录」这项设置走；没设就是全盘
+      scanPathPrefix: () => _dirs.localScanPath,
+      // 清单一有变化（扫描完 / 补到了线上身份）就把队列里本机歌的封面补齐。
+      // 不在这里 notify 一次以上都不做：队列元素是点歌那一刻映射出来的快照，
+      // 补全发生在之后，不回填就会出现「列表已有封面、播放页还在放渐变」。
+      onChange: () {
+        _syncQueueCoverWithLocalLibrary();
+        _notifyIfMounted();
+      },
+    );
+    _download = DownloadBox(
+      repo: () => _repo,
+      // 只把「解析一条可下流的地址」这一件事交给它，不把整个播放器递过去：
+      // DownloadBox 因此能脱离音频后端单测（真的 controller 会起 2 秒
+      // 周期的看门狗 Timer，单测里就是悬挂计时器）。
+      resolve: (song, ceiling) async {
+        final r = _player?.resolver;
+        if (r == null) {
+          return (url: null, qualityId: 0, mime: 'audio/mp4', error: '播放器未初始化');
+        }
+        final res = await r.resolveForDownload(song, ceiling: ceiling);
+        return (
+          url: res.ok ? res.url : null,
+          qualityId: res.qualityId,
+          mime: res.mimeType,
+          error: res.ok ? null : (res.error ?? '拿不到下载地址'),
+        );
+      },
+      // CDN 校验 Referer/UA，缺一个就是 403；由当前源适配器给
+      streamHeaders: () => _player?.resolver?.sourceHeaders ?? const {},
+      dirs: () => _dirs,
+      downloadQuality: () => _downloadQuality,
+      // 「已下载」的唯一真相就是下载清单，不另开一份索引
+      downloaded: () => _local.downloadedTracks,
+      reloadDownloaded: _local.load,
       onChange: _notifyIfMounted,
     );
     // 主题模式持久化：不读盘的话每次冷启动都会「默认浅色」，
@@ -125,15 +187,26 @@ class AppState extends ChangeNotifier {
   final SettingsStore? _settings;
 
   // ---- 偏好设置 ----
-  QualityPreference _quality = QualityPreference.auto;
+  //
+  // 音质偏好拆成两条独立上限（2026-10-11）：在线拉流看 [_onlineQuality]，
+  // 落盘下载看 [_downloadQuality]。分开是因为代价不同——在线选高了只多花
+  // 流量，下载选高了是把几十 MB 永久写进手机。
+  QualityPreference _onlineQuality = QualityPreference.auto;
+  QualityPreference _downloadQuality = QualityPreference.high;
 
-  /// 音质上限偏好。播放器拉流时按它挑音质。
-  QualityPreference get quality => _quality;
+  /// 在线音质上限。播放器拉流时按它挑音质。
+  QualityPreference get onlineQuality => _onlineQuality;
 
-  /// 音质上限偏好的 B站音质 ID（0 = 不限制）
-  int get qualityCeilingId => _quality.id;
+  /// 在线音质上限的 B站音质 ID（0 = 不限制）
+  int get qualityCeilingId => _onlineQuality.id;
 
-  /// 改音质偏好：落盘 + 让**当前在播的这首**立刻按新上限重拉。
+  /// 下载音质上限。下载器（第二期）落盘时按它挑流；此处先只存偏好。
+  QualityPreference get downloadQuality => _downloadQuality;
+
+  /// 下载音质上限的 B站音质 ID（0 = 不限制）
+  int get downloadQualityCeilingId => _downloadQuality.id;
+
+  /// 改在线音质偏好：落盘 + 让**当前在播的这首**立刻按新上限重拉。
   ///
   /// ## 为什么要主动重拉一次
   /// 只改 [qualityCeilingId] 的话，偏好要到「下一次拉流」才生效——
@@ -151,13 +224,13 @@ class AppState extends ChangeNotifier {
   ///   2. 忽略 `playSong` 的返回错误 → 装载失败也继续往下走；
   ///   3. 无条件 `seek(at)` → 切歌顶掉本次重拉后（[_playGen] 已变），
   ///      **新歌**会被 seek 回旧歌的进度。
-  Future<void> setQuality(QualityPreference q) async {
-    if (_quality == q) return;
-    _quality = q;
+  Future<void> setOnlineQuality(QualityPreference q) async {
+    if (_onlineQuality == q) return;
+    _onlineQuality = q;
     // 必须先 notify：main.dart 的监听器据此把新值写进 Resolver，
     // 本次重拉与后续所有拉流都依赖这一步。
     notifyListeners();
-    await _settings?.setQuality(q);
+    await _settings?.setOnlineQuality(q);
 
     final p = _player;
     final song = current;
@@ -172,7 +245,8 @@ class AppState extends ChangeNotifier {
     _setResolving(true);
     try {
       // 60s 兜底与 _playResolved 一致：极端弱网下 playSong 可能长时间不返回。
-      final err = await p.playSong(song, forceRefresh: true)
+      final err = await p
+          .playSong(song, forceRefresh: true)
           .timeout(const Duration(seconds: 60));
       if (!mounted) return;
       // 重拉期间被切歌顶掉：静默退出。新任务已接管 resolving / 进度 /
@@ -202,6 +276,17 @@ class AppState extends ChangeNotifier {
       _playing = false;
       notifyListeners();
     }
+  }
+
+  /// 改下载音质偏好：只落盘 + 通知 UI。
+  ///
+  /// 与在线档不同，这里**不碰正在播放的歌**：下载上限管的是「以后下载的
+  /// 文件用什么码率」，跟当前这一次拉流无关，重拉只会白白打断收听。
+  Future<void> setDownloadQuality(QualityPreference q) async {
+    if (_downloadQuality == q) return;
+    _downloadQuality = q;
+    notifyListeners();
+    await _settings?.setDownloadQuality(q);
   }
 
   // ---- 诊断日志 ----
@@ -257,7 +342,8 @@ class AppState extends ChangeNotifier {
   }
 
   Future<void> verifyBiliSession() => _bili.verify();
-  Future<void> applyBiliSession(String cookieHeader) => _bili.apply(cookieHeader);
+  Future<void> applyBiliSession(String cookieHeader) =>
+      _bili.apply(cookieHeader);
   Future<void> biliLogout() => _bili.logout();
 
   /// 当前这首歌**实际**在播的音质（B站音质 ID，0 = 还没解析出来）。
@@ -351,24 +437,36 @@ class AppState extends ChangeNotifier {
   bool _playing = false;
   int _duration = 0;
 
-  /// 播放位置（秒）的私有真值。**只能经由 [_position] 的 setter 写**，
-  /// 这样才能保证每一次写入都同步发布到 [posTick]。
-  int _positionRaw = 0;
-
-  /// 当前播放位置（秒）。
+  /// 播放位置（**毫秒**）的私有真值。
   ///
-  /// 做成 getter/setter 而不是裸字段，是为了让「写位置」与「发进度通知」
-  /// 成为**同一个动作**：类内原有 11 处 `_position = x`（切歌归零、恢复
-  /// 续播、seek、位置流推送…）不必逐个改，也不可能漏掉某一处导致
-  /// 进度条停在上一首的数值。
-  int get _position => _positionRaw;
+  /// 毫秒而不是秒：歌词校准有 ±50ms 档位，且 LRC 时间戳精确到 10ms，
+  /// 秒级截断会让任何亚秒级微调失效（点 20 次 +50ms 才跨过一个秒边界）。
+  int _positionMsRaw = 0;
 
-  set _position(int v) {
-    if (_positionRaw == v) return;
-    _positionRaw = v;
-    // ValueNotifier 自带等值去重：同一秒内的多次写入只会通知一次。
-    posTick.value = v;
+  /// 当前播放位置（秒）。类内历史代码全部走秒口径，保留它避免逐处改。
+  ///
+  /// 写秒 = 写整秒毫秒（无播放器的模拟 ticker、切歌归零、续播等），
+  /// 真实播放器的位置流走 [_positionMs] 毫秒口径。
+  int get _position => _positionMsRaw ~/ 1000;
+
+  set _position(int v) => _positionMs = v * 1000;
+
+  /// 当前播放位置（毫秒）。**写位置与发 [posTick] 必须是同一个动作**：
+  /// setter 统一发秒粒度通知（ValueNotifier 自带跨值去重，同秒内只通知一次）。
+  int get _positionMs => _positionMsRaw;
+
+  set _positionMs(int v) {
+    if (_positionMsRaw == v) return;
+    _positionMsRaw = v;
+    _posSampleAtMs = _posClock.elapsedMilliseconds;
+    posTick.value = v ~/ 1000;
   }
+
+  /// 单调时钟（不受系统时间调整、NTP 校时影响）。
+  final Stopwatch _posClock = Stopwatch()..start();
+
+  /// [_positionMsRaw] 最后一次被赋值时的 [_posClock] 读数。
+  int _posSampleAtMs = 0;
 
   /// 播放进度的**高频通知通道**（秒粒度）。
   ///
@@ -397,8 +495,8 @@ class AppState extends ChangeNotifier {
   PlayMode _mode = PlayMode.sequential;
   Timer? _ticker;
 
-  /// 全局随机源：next(shuffle) / shufflePlay 共用一个实例，避免每次 new
-  /// Random() 的轻量开销；next 还会主动排除当前 index，防止随机到同一首。
+  /// 全局随机源：next(shuffle) / 「猜你想听」的打散共用一个实例，避免每次
+  /// new Random() 的轻量开销；next 还会主动排除当前 index，防止随机到同一首。
   final Random _rng = Random();
 
   // ---- 曲库 ----
@@ -419,10 +517,16 @@ class AppState extends ChangeNotifier {
   //
   // ## 为什么两个集合
   // `_likedIds` 是**真相**（数据库自增主键），落库只认它；
-  // `_likedKeys` 是渲染缓存（`title|artist`），让 `isLiked(Song)` 不查库。
+  // `_likedKeys` 只服务「没有 id 的歌」——mock 模式的演示歌、以及本机扫描
+  //   出来但没入库的文件（见 [localEntryToSong]，那条 id 是 null）。
   //
-  // 单用一个 `key` 集合的后果：导入的歌还没拿到 id 时无法收藏，
-  // 且改名后红心会失联。真实模式下两者都维护，mock 模式下只有 keys。
+  // ## 为什么红心按 id 判、不按 key（2026-10-11 修「收藏显示 1 首但列表空」）
+  // 旧实现 `isLiked` 只查 key 集合，而 key 集合是**曲库窗口 ∩ 数据库**的产物：
+  // `_library` 只装最近 500 行，在一首窗口外的歌（榜单点进来的、本机文件）
+  // 上点心 → 计数 +1，可 `library.where(isLiked)` 里根本没有那首歌 →
+  // 收藏页「暂无内容」。真机 2026-10-11 复现的就是这一对。
+  // 现在计数、红心、列表三者**同源于数据库**，不再经过曲库窗口。
+  // 歌被删时 liked 行随 CASCADE 一起走，也不会留下点不亮的孤儿计数。
   final Set<int> _likedIds = {};
   final Set<String> _likedKeys = {};
 
@@ -437,9 +541,25 @@ class AppState extends ChangeNotifier {
 
   // ---- 搜索 ----
   bool _searchOpen = false;
+
   /// 在线搜索子模块（关键词 / 历史 / 四分类结果 / 竞态防护 / 导入进度）。
   /// 实现拆在 state/online_search.dart（P3 组合式拆分），这里只做同名转发。
   late final OnlineSearchBox _search;
+
+  /// 「猜你想听」子模块（口味种子 → QQ 歌手热歌 + 榜单掺新 → 成队列起播）。
+  /// 实现拆在 state/guess_for_you.dart，理由同上。
+  late final GuessForYouBox _guess;
+
+  /// 「歌曲目录」子模块（本地扫描范围 / 下载落点，两项都走 SAF 选择）。
+  /// 实现拆在 state/music_dirs.dart——它有自己的失效语义（授权可能被动撤销）。
+  late final MusicDirsBox _dirs;
+
+  /// 本机音频清单（自带扫描 + app 下载）。实现在 state/local_library.dart。
+  late final LocalLibraryBox _local;
+
+  /// 播放页下载（解析下载地址 → 原生落盘 → 回推进度）。
+  /// 实现在 state/download.dart。
+  late final DownloadBox _download;
 
   // ---- getters ----
 
@@ -501,11 +621,36 @@ class AppState extends ChangeNotifier {
   /// 在线搜索是否可用：数据层未接入（单测/预览）时没有 QQ 接口，不可用
   bool get canSearchOnline => _repo != null;
 
-  bool isLiked(Song s) => _likedKeys.contains(s.key);
+  /// 这首歌当前是否显示红心。
+  ///
+  /// 有 id 一律按 id 判（数据库真相，覆盖「不在曲库窗口里」的歌）；
+  /// 没 id 的（mock 演示歌 / 未入库的本机文件）才退回 `title|artist`。
+  bool isLiked(Song s) => s.id != null
+      ? _likedIds.contains(s.id)
+      : _likedKeys.contains(s.key);
   double get progress =>
       _duration > 0 ? (_position / _duration).clamp(0.0, 1.0) : 0.0;
 
-  int get likedCount => _likedKeys.length;
+  /// 收藏数量 = **数据库里的收藏行数**，不是「当前曲库窗口里数得着的红心」。
+  ///
+  /// 两者不是一回事：曲库只加载最近 500 行（[loadLibrary]），收藏却可能
+  /// 落在更早的歌上——按窗口数就会出现「列表页一首都没有、计数写着 1 首」。
+  int get likedCount => usingMock ? _likedKeys.length : _likedIds.length;
+
+  /// 收藏列表（按收藏时间倒序，最近在前），**现查数据库**。
+  ///
+  /// 与 [library] 无关：不受「最近 500 行」这个窗口限制。
+  /// mock 模式（无数据层）退回内存里的演示歌，保证 UI 预览有内容。
+  Future<List<Song>> likedSongsList({int limit = 500}) async {
+    final repo = _repo;
+    if (repo == null) return _library.where(isLiked).toList();
+    try {
+      return (await repo.likedSongs(limit: limit)).map((e) => e.song).toList();
+    } catch (e) {
+      _loadError = '收藏读取失败：$e';
+      return const [];
+    }
+  }
 
   /// 常听（按有效播放次数倒序）。
   ///
@@ -540,6 +685,11 @@ class AppState extends ChangeNotifier {
 
     _loadState = LibraryLoadState.loading;
     _loadError = null;
+    // ⚠️ 本方法会被多处 unawaited 调用（搜索导入回调、refreshLibrary、
+    // confirmSource / rematchSong / bindManualSource / playOnline 等），
+    // 期间 dispose 完全可能发生。下面 finally 的两处通知都判了 mounted，
+    // 唯独这里漏了——必须同样挡住，否则「退出 app 时恰好在加载曲库」就崩。
+    if (!mounted) return;
     notifyListeners();
 
     try {
@@ -550,16 +700,11 @@ class AppState extends ChangeNotifier {
 
       // 同步收藏状态。收藏是持久化在 liked_song 表里的用户行为，
       // 不重新拉一次的话，重启 app 后红心会全部消失（看起来像「没存上」）。
+      // ⚠️ 这里拿的是**全表** id，不按曲库窗口过滤：红心与计数都要覆盖
+      // 「最近没导入进那 500 行窗口」的老收藏（见 [_likedIds] 的说明）。
       _likedIds.clear();
       _likedKeys.clear();
-      for (final r in await repo.likedIds()) {
-        _likedIds.add(r);
-      }
-      for (final s in _library) {
-        if (s.id != null && _likedIds.contains(s.id)) {
-          _likedKeys.add(s.key);
-        }
-      }
+      _likedIds.addAll(await repo.likedIds());
 
       // 同步待确认数（REVIEW 队列真实条数）
       final stats = await repo.stats();
@@ -593,6 +738,11 @@ class AppState extends ChangeNotifier {
         //    播放位置一概不动。
         _syncQueueWithLibrary();
       }
+
+      // 本机音频两份清单跟着曲库一起刷新：它们和曲库数字出现在同一批
+      // 界面上（「我的」页的本地入口副标题），分两处加载会出现曲库新、
+      // 本地条目旧。纯本地 SQLite 查询，不发任何请求。
+      await _local.load();
 
       // ⚠️ 上面有多个 await。loadLibrary 常被 unawaited 调用
       // （playOnline / ensurePlayableSource 里都是），AppState 若在
@@ -829,6 +979,8 @@ class AppState extends ChangeNotifier {
           _replaceQueued(songId, fresh);
           await p.playSong(fresh, forceRefresh: true);
           if (!mounted) return '已指定音源：${video.bvid}';
+          _playbackError = null; // 手动匹配成功 → 清除旧错误提示
+          _pendingAlign = null; // 旧源时间轴上的半成品锚点作废
           _syncPlayingQuality();
           notifyListeners();
         }
@@ -857,10 +1009,9 @@ class AppState extends ChangeNotifier {
   ///  - **落库即刷新**：写库后调 [refreshLibrary]，曲库列表与统计立刻跟上。
   ///  - **如果切的是当前在播的歌，立即重拉流**：用 `forceRefresh: true` 跳过
   ///    SourceResolver 的 URL 缓存，避免播的还是旧音源。
-  ///
-  /// 设计文档 6.4：用户改选记为 USER_SELECTED（调参最有价值的样本）；
-  /// 当前实现只完成"切到 bvid"，score 类型留为原值——切后整库会被
-  /// 后续 matchOne 重新评估。如果后面要严格区分，选时再带 score。
+  ///  - **回填 Golden Dataset 反馈**：用户改选是对此前匹配快照的裁决——
+  ///    选回快照 best 记 accept，选了别的记 reject（最有价值的负样本，
+  ///    见 `MatchSampleDao.markUserChoice`）。
   Future<String> switchSource({
     required int songId,
     required String bvid,
@@ -869,6 +1020,9 @@ class AppState extends ChangeNotifier {
     if (repo == null) return '数据层未接入';
     try {
       await repo.db.bindings.activate(songId, bvid);
+      // 放在 activate 之后：绑定成功才回填反馈。DAO 内部静默失败，
+      // 不影响换源主流程。
+      await repo.db.matchSamples.markUserChoice(songId, bvid);
       await refreshLibrary();
 
       final cur = current;
@@ -880,6 +1034,8 @@ class AppState extends ChangeNotifier {
           _replaceQueued(songId, fresh);
           await p.playSong(fresh, forceRefresh: true);
           if (!mounted) return '已切换为 $bvid';
+          _playbackError = null; // 换源成功 → 清除旧错误提示
+          _pendingAlign = null; // 旧源时间轴上的半成品锚点作废
           _syncPlayingQuality();
           notifyListeners();
         }
@@ -912,10 +1068,14 @@ class AppState extends ChangeNotifier {
   /// 3s 而非更早版本的 5s：轻提示是单行短文案（10~20 字），5s 驻留过长
   /// （2026-09-30 用户反馈）。带错误详情的长文案走播放页 SnackBar。
   void showToast(String msg) {
+    // 防御：showToast 的调用点分散在多处 async 之后，调用方漏判 mounted
+    // 时这里兜底，避免直接抛「used after being disposed」。
+    if (!mounted) return;
     _toast = msg;
     notifyListeners();
     _toastTimer?.cancel();
     _toastTimer = Timer(const Duration(seconds: 3), () {
+      if (!mounted) return;
       _toast = null;
       notifyListeners();
     });
@@ -960,9 +1120,24 @@ class AppState extends ChangeNotifier {
   StreamSubscription<Duration>? _durSub;
   StreamSubscription<bool>? _playSub;
 
-  /// 播放失败 / 音源失效的提示文案（UI 用 SnackBar 展示）
+  /// 播放失败 / 音源失效的提示文案（UI 用顶部横幅展示）
   String? _playbackError;
   String? get playbackError => _playbackError;
+
+  /// 仅用于测试：直接设置播放错误状态，模拟匹配失败 / 装载失败。
+  @visibleForTesting
+  set playbackError(String? value) => _playbackError = value;
+
+  /// 仅用于测试：注入当前歌词（测试环境无 repo，歌词无法走网络加载）。
+  @visibleForTesting
+  set debugLyric(ParsedLyric lyric) {
+    _lyric = lyric;
+    _updateLyricLine();
+  }
+
+  /// 仅用于测试：直接设置播放位置（毫秒），模拟播放推进。
+  @visibleForTesting
+  set debugPositionMs(int ms) => _positionMs = ms;
 
   void clearPlaybackError() {
     _playbackError = null;
@@ -1024,6 +1199,13 @@ class AppState extends ChangeNotifier {
 
   /// 加载当前歌的歌词。
   ///
+  /// ## 两条来源，一个出口
+  ///   - **AMLL TTML 命中**（约一半热门歌）：Apple Music 的真实逐字轴。
+  ///     这份歌词**整体替换** LRC——行文本、行时间、字时间、译文是
+  ///     自洽的一套，不能和 QQ 的 LRC 混拼（不同源，逐行对齐一错就是整句错位）。
+  ///   - **只有 QQ 的逐行 LRC**：行级时间轴照常，字轴由 [applyWordTiming]
+  ///     按字数均分推算，扫光仍能动，只是跟不上真实语速。
+  ///
   /// 歌词来源是 QQ音乐（与元数据同源，有 songMid 就能取）。
   /// 取不到不是错误——纯音乐、下架曲目都可能没有，静默留空。
   Future<void> loadLyricForCurrent({bool force = false}) async {
@@ -1038,14 +1220,35 @@ class AppState extends ChangeNotifier {
     _lyricFor = song.key;
     _lyricLoading = true;
     _lyric = ParsedLyric.empty;
+    _lyricWordSource = null;
     notifyListeners();
 
     try {
-      final bundle = await repo.fetchLyric(song);
-      final raw = bundle?.lrc;
-      _lyric = raw == null || raw.trim().isEmpty
-          ? ParsedLyric.empty
-          : attachTranslation(parseLrc(raw), bundle?.translation);
+      final bundle = await repo.fetchLyric(
+        song,
+        // 本机歌（曲库里没有行 / 那行的 mid 是派生键）靠补到的 songMid 取词
+        midFallback: _localSongMid(song),
+      );
+      final totalMs = song.duration * 1000;
+      if (bundle == null) {
+        _lyric = ParsedLyric.empty;
+      } else {
+        // ① 优先真实逐字轨
+        ParsedLyric? parsed;
+        if (bundle.hasWordTrack) {
+          final ttml = parseTtmlLyric(bundle.wordLyric!);
+          if (!ttml.isEmpty && ttml.hasWords) {
+            parsed = ttml;
+            _lyricWordSource = bundle.wordSource ?? 'amll';
+          }
+          // 解析不出可用字轴（站点改版 / 畸形文件）→ 静默回落到 LRC 轨
+        }
+        // ② 逐行 LRC + 译文
+        parsed ??= attachTranslation(
+            parseLrc(bundle.lrc), bundle.hasTranslation ? bundle.translation : null);
+        // ③ 统一出口：给缺字轴的行补均分轴
+        _lyric = applyWordTiming(parsed, totalDurationMs: totalMs);
+      }
     } catch (_) {
       // 歌词失败不影响播放，静默留空
       _lyric = ParsedLyric.empty;
@@ -1059,6 +1262,13 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// 当前歌词的字轴来源：'amll'（真实逐字轴）/ null（均分推算或无字轴）。
+  ///
+  /// 只给歌词页的校准条展示。做成公开只读而不是塞进 ParsedLyric，
+  /// 是因为它属于「这份数据从哪来」的运行时信息，与解析结果本身无关。
+  String? _lyricWordSource;
+  String? get lyricWordSource => _lyricWordSource;
+
   void _bindPlayer() {
     final p = _player;
     if (p == null) return;
@@ -1069,7 +1279,8 @@ class AppState extends ChangeNotifier {
       // 旧值覆盖（「停在上一首歌的时间」的直接来源）。此时的新歌进度
       // 只能是 0，等装载完成后位置流自然会恢复推送。
       if (_resolving) return;
-      _position = d.inSeconds;
+      // 毫秒口径：歌词映射（mappedLyricMs）与 ±50ms 校准依赖亚秒精度。
+      _positionMs = d.inMilliseconds;
       // 累计本次「实际听了多久」。用它而不是「点了多少次」来计播放次数——
       // 点开又秒切不该算听过（见 PlayStatsDao.countingThresholdMs）。
       _stats.accumulate(d);
@@ -1079,7 +1290,8 @@ class AppState extends ChangeNotifier {
       // 是内存级操作 + 异步刷盘，15 秒一次的开销可忽略。
       // 恢复态续播未完成前不打点：装载初期的位置事件从 0 推进，
       // 会把快照里刚存的进度覆盖掉。
-      if (_resumeSeekSec == null && (_position - _lastPersistedPos).abs() >= 15) {
+      if (_resumeSeekSec == null &&
+          (_position - _lastPersistedPos).abs() >= 15) {
         unawaited(persistSession());
       }
       // ⚠️ 这里**故意不调 notifyListeners()**：位置在走是高频道事件，
@@ -1112,11 +1324,21 @@ class AppState extends ChangeNotifier {
     p.onSkipToNext = () async => next();
     p.onSkipToPrevious = () async => previous();
 
+    // 通知栏/锁屏播放键在「handler 完全不记得当前歌」时（进程被杀后
+    // 冷唤醒引擎）的兜底：委托给界面同一个 togglePlay——它的空源分支
+    // 会走恢复态续播 / 失败态重播，与用户在应用里按播放完全同链路。
+    p.onColdPlay = () => togglePlay();
+
     // 播放出错 → 大概率是 URL 过期，重解析一次（必要时自动重新匹配）
     p.onPlaybackError = (e) async {
       final song = current;
       if (song == null) return;
       final r = await p.resolver?.resolveAfterPlaybackError(song);
+      // ⚠️ 上面的 resolve 会打网络 + 可能跑完整重匹配（数十秒），
+      // 期间用户很可能已经把 app 退出了。这里必须挡一道，
+      // 否则 notifyListeners() 抛「used after being disposed」。
+      // 这是播放失败的**默认路径**（403 / URL 过期），最容易踩到。
+      if (!mounted) return;
       if (r == null || !r.ok) {
         _playbackError = r?.error ?? '播放失败';
         _playing = false;
@@ -1138,41 +1360,60 @@ class AppState extends ChangeNotifier {
   /// 返回一个「应该用这个毫秒值去查歌词行」的 int。
   ///
   /// ## 为什么需要这层映射
-  /// B站音源（MV/UP主上传）的音频总长可能与 QQ 音乐元数据时长差几秒：
-  /// - 官方 MV 有 3~15s 片头/片尾 → 真实音频更长
-  /// - UP 主加速/减速/剪辑过 → 真实音频更短
-  /// 直接把真实位置当 LRC 时间查，歌词会整体错位。
+  /// B站音源（MV/UP主上传）与 QQ音乐的歌曲时间轴不一定重合：
+  /// - 官方 MV 有 3~15s 片头/片尾 → 真实音频整体平移
+  /// - UP 主加速/减速过 → 两条时间轴斜率不同
+  /// 直接把真实位置当 LRC 时间查，歌词会错位。
   ///
-  /// ## 两层修正
-  /// 1. **比例因子**（自动）：`scale = lrcTailMs / realDurationMs`
-  ///    把真实音频的时间轴等比例压缩/拉伸，两端对齐 LRC 的起止点。
-  ///    这层能消除 UP 主加速减速导致的整曲等比例错位。
-  /// 2. **用户校准偏移**（手动）：per-song 存 `lyricOffsetMs`。
-  ///    比例映射无法消除片头/片尾这类「只在开头/结尾出问题」的错位，
-  ///    用户手动 ±500ms 即可对齐。
+  /// ## 模型：一条直线 `lrcMs = realMs × slope + offsetMs`
+  /// - **slope = 1.0（默认，纯平移）**：覆盖片头/片尾/尾奏——90% 的场景。
+  ///   平移由自动片头预填（[_computeAutoLyricOffset]）或用户 ±按钮给出，
+  ///   **一次校准全曲都准**，误差不会随播放位置累积。
+  /// - **slope ≠ 1.0（两点校准）**：用户在歌曲两个位置各做一次
+  ///   「本句对齐」（[alignLyricLine]），由两个锚点算出斜率，
+  ///   覆盖 UP 主整曲变速。
   ///
-  /// 公式：`mappedMs = (realPosMs × scale).round() + userOffsetMs`
+  /// ## 为什么不再自动按 `lrcTail / realDuration` 缩放（旧实现的坑）
+  /// 旧实现用「最后一行歌词时间 ÷ 视频总时长」做自动 scale：
+  /// 最后一行唱词普遍早于音频结束（尾奏 10~20s），导致 scale 系统性偏小，
+  /// 歌词在歌曲中段就偏几秒、越往后越偏；它与用户 offset 叠加后，
+  /// 数学上只能对齐一个时间点——用户表现为「调完过一会又不匹配」。
+  /// 自动 scale 只在「整曲均匀变速」下才正确，而那恰恰是少见场景，
+  /// 且该场景现在由两点校准显式覆盖。
+  /// 真实音频毫秒 → **LRC 时间空间**毫秒。
   ///
-  /// ## 零防护
-  /// - 歌词为空 → 返回真实位置（后续 _updateLyricLine 直接 return，不影响）
-  /// - 音频时长未知（_duration = 0）→ scale = 1.0，等价于纯偏移
-  /// - LRC 只有一行且没有有效 tail → scale = 1.0
-  int get mappedLyricMs {
-    final realPosMs = _position * 1000;
-    final lines = _lyric.lines;
-    if (lines.isEmpty || _duration <= 0) return realPosMs;
-
-    final lrcTailMs = lines.last.time.inMilliseconds;
-    final realTailMs = _duration * 1000;
-
-    // scale = lrc 空间长度 / 真实空间长度
-    // < 1 → 真实音频更长（有片头/片尾）；> 1 → 真实音频更短（被剪辑）
-    final scale =
-        (lrcTailMs > 0 && realTailMs > 0) ? (lrcTailMs / realTailMs) : 1.0;
-
-    final lrcPosMs = (realPosMs * scale).round();
+  /// 抽成方法而不是只留 `mappedLyricMs` getter：逐字扫光要拿「外推出来的
+  /// 位置」去查字轴，必须和整行高亮走同一个映射。两处各写一遍
+  /// `realMs * slope + offset` 迟早会漂移成「高亮在第二行、填充画在第一行」。
+  int mappedLyricMsAt(int realMs) {
+    final slope = current?.lyricSlope ?? 1.0;
     final userOffset = current?.lyricOffsetMs ?? 0;
-    return lrcPosMs + userOffset;
+    return (realMs * slope).round() + userOffset;
+  }
+
+  int get mappedLyricMs => mappedLyricMsAt(_positionMs);
+
+  /// 逐字扫光用的「此刻在歌词时间轴的哪里」。
+  ///
+  /// ## 为什么要外推
+  /// just_audio 的 `positionStream` 约 200ms 推一次，而扫光要 60fps
+  /// （约 16ms 一帧）才看得出连续移动。为此加一条高频通知通道会直接
+  /// 撞回 [posTick] 那条性能修复的注释——整棵树每秒重建好几次。
+  ///
+  /// 正确姿势是**只暴露锚点，让唯一要动的那一小块自己算**：
+  ///   此刻位置 ≈ 上次推送的位置 + (单调时钟已走过的时间)
+  /// 播放页歌词组件每帧调一次，代价是一次加法和一次乘法，
+  /// 全程零 notifyListeners、零 ValueNotifier 写入。
+  ///
+  /// ## 为什么钳 1 秒
+  /// 切后台、系统节流、播放器卡死时，`elapsed` 会一路涨而不伴随新的位置推送。
+  /// 不设上限就会把歌词"空转"到末尾，用户切回来看到一句已经唱完的歌词。
+  /// 钳在 1 秒内：短到不会明显跑偏，长到能覆盖 200ms 推送间隔的抖动。
+  int karaokeLyricMs() {
+    if (!_playing) return mappedLyricMs;
+    final drift = _posClock.elapsedMilliseconds - _posSampleAtMs;
+    if (drift <= 0) return mappedLyricMs;
+    return mappedLyricMsAt(_positionMsRaw + (drift > 1000 ? 1000 : drift));
   }
 
   /// 按当前播放位置刷新歌词高亮行。
@@ -1199,51 +1440,120 @@ class AppState extends ChangeNotifier {
 
   // ── 歌词手动校准 ──────────────────────────────────────
   //
-  // 纯比例映射能消除 UP 主加速减速导致的整曲等比例错位，
-  // 但 MV 片头/片尾这类「只在开头/结尾出问题」的错位无法靠比例消掉。
-  // 这里让用户按 ±500ms 微调，存 per-song。
+  // 模型：lrcMs = realMs × slope + offsetMs（见 mappedLyricMs）。
+  // ±按钮改 offset（平移，覆盖片头/片尾/尾奏）；长按歌词行「本句对齐」
+  // 做一次是平移、间隔较远做两次即可定出 slope（覆盖 UP 主整曲变速）。
 
-  /// 按 [deltaMs]（可正可负，通常 ±500）调整当前歌的歌词校准偏移。
+  /// 两点校准中等待配对的第一个锚点（仅内存态，不持久化——校准是
+  /// 十几秒内完成的连续动作；切歌 / 换源 / 手动平移都会令它作废）。
+  ({int realMs, int lrcMs, int songId})? _pendingAlign;
+
+  /// 是否有一个待配对的对齐锚点（歌词页校准条据此显示引导文案）。
+  bool get lyricAlignPending => _pendingAlign != null;
+
+  /// 两个锚点的最小间隔（毫秒）。间隔太近时，位置/时间戳的小误差会被
+  /// 斜率放大到全曲，算出来的 slope 不可用。
+  static const int alignMinGapMs = 20000;
+
+  /// 斜率合理区间：正常变速很少超出 ±10%，放宽到 [0.5, 2.0] 仅为防误操作。
+  static const double alignSlopeMin = 0.5;
+  static const double alignSlopeMax = 2.0;
+
+  /// 按 [deltaMs]（可正可负，通常 ±500）微调当前歌的歌词平移偏移。
   ///
   /// **语义**：正数 = 歌词整体后移（需要再推进一点播放位置才到这一句）；
-  /// 负数 = 歌词整体前移。
+  /// 负数 = 歌词整体前移。只改截距，slope 保持不变。
   ///
   /// 偏移写入数据库持久化，下次播放同一首歌自动生效。
   void adjustLyricOffset(int deltaMs) {
     final cur = current;
     if (cur == null || _index < 0) return;
 
-    final newOffset = cur.lyricOffsetMs + deltaMs;
-    // 先更新内存中的 current 引用（让 mappedLyricMs 立即读到新值）
-    _queue[_index] = cur.copyWith(lyricOffsetMs: newOffset);
+    // 手动平移后，挂起的锚点基准已过时，作废重来
+    _pendingAlign = null;
+    _writeCalibration(cur, offsetMs: cur.lyricOffsetMs + deltaMs);
+  }
 
-    // 持久化：数据库写入是异步的，不阻塞 UI
+  /// 把第 [lineIndex] 行歌词对准**当前播放位置**（长按歌词行触发）。
+  ///
+  /// - 第一次：立即按平移生效（沿用当前 slope 重算 offset），并挂起锚点；
+  /// - 第二次：与首点间隔 ≥ [alignMinGapMs] 时由两点算出 slope 与 offset，
+  ///   完成变速校准；太近 / 结果异常则保留第一次的平移，挂起锚点不清除，
+  ///   用户可走到歌曲远处再试一次。
+  ///
+  /// 返回给用户看的提示文案；null 表示状态不允许（无歌 / 行号越界）。
+  String? alignLyricLine(int lineIndex) {
+    final cur = current;
+    if (cur == null || cur.id == null || _index < 0) return null;
+    final lines = lyrics;
+    if (lineIndex < 0 || lineIndex >= lines.length) return null;
+
+    final realNow = _positionMs;
+    final lrcNow = lines[lineIndex].time.inMilliseconds;
+    final pending = _pendingAlign;
+
+    if (pending == null || pending.songId != cur.id) {
+      // 第一次：保留 slope，只重算截距 → 平移立即生效
+      final newOffset = lrcNow - (realNow * cur.lyricSlope).round();
+      _writeCalibration(cur, offsetMs: newOffset);
+      _pendingAlign = (realMs: realNow, lrcMs: lrcNow, songId: cur.id!);
+      return '已把这句对准当前位置';
+    }
+
+    // 第二次：两点定斜率
+    final dReal = realNow - pending.realMs;
+    if (dReal.abs() < alignMinGapMs) {
+      return '两个对齐点太近，请在间隔 20 秒以上的位置再对准一次';
+    }
+    final slope = (lrcNow - pending.lrcMs) / dReal;
+    if (slope < alignSlopeMin || slope > alignSlopeMax) {
+      return '校准结果异常（速度差过大），已保留第一次的对齐';
+    }
+    final newOffset = pending.lrcMs - (pending.realMs * slope).round();
+    _writeCalibration(cur, offsetMs: newOffset, slope: slope);
+    _pendingAlign = null;
+    final pct = (slope - 1.0) * 100;
+    final pctText = pct.abs() < 0.5
+        ? ''
+        : '（速度差 ${pct > 0 ? '+' : ''}${pct.toStringAsFixed(1)}%）';
+    return '两点校准完成$pctText';
+  }
+
+  /// 统一的校准写入：更新队列引用 + 落库 + 刷新歌词行 + 通知 UI。
+  void _writeCalibration(Song cur, {required int offsetMs, double? slope}) {
+    _queue[_index] = cur.copyWith(
+      lyricOffsetMs: offsetMs,
+      lyricSlope: slope ?? cur.lyricSlope,
+    );
+
     final repo = _repo;
     final id = cur.id;
     if (repo != null && id != null) {
-      unawaited(repo.db.songs.updateLyricOffset(id, newOffset));
+      unawaited(
+        repo.db.songs.updateLyricCalibration(
+          id,
+          offsetMs: offsetMs,
+          slope: slope,
+        ),
+      );
     }
 
-    // 立即重算高亮行（mappedLyricMs 已读到新 offset）
     _updateLyricLine();
     notifyListeners();
   }
 
-  /// 重置当前歌的歌词校准偏移为 0（仅保留自动比例映射）。
+  /// 重置当前歌的歌词校准：平移归零、斜率恢复 1.0、丢弃挂起锚点。
   void resetLyricOffset() {
     final cur = current;
-    if (cur == null || cur.lyricOffsetMs == 0) return;
-
-    _queue[_index] = cur.copyWith(lyricOffsetMs: 0);
-
-    final repo = _repo;
-    final id = cur.id;
-    if (repo != null && id != null) {
-      unawaited(repo.db.songs.updateLyricOffset(id, 0));
+    if (cur == null) return;
+    if (cur.lyricOffsetMs == 0 &&
+        cur.lyricSlope == 1.0 &&
+        _pendingAlign == null) {
+      return;
     }
 
-    _updateLyricLine();
-    notifyListeners();
+    _pendingAlign = null;
+    _writeCalibration(cur, offsetMs: 0, slope: 1.0);
   }
 
   /// 计算给定歌曲的"首次播放时自动预填歌词偏移量"。
@@ -1253,8 +1563,8 @@ class AppState extends ChangeNotifier {
   /// 视频比歌曲长（durationDelta > 0）说明有片头，歌词要整体后移（offset 为负）
   /// 才能让 mappedLyricMs 在片头期间返回 < 0（不高亮）、片头结束后才对齐。
   int? _computeAutoLyricOffset(Song song) {
-    // 已经手动校准过了（非 0），尊重用户选择
-    if (song.lyricOffsetMs != 0) return null;
+    // 已经手动校准过了（平移非 0，或做过两点变速校准），尊重用户选择
+    if (song.lyricOffsetMs != 0 || song.lyricSlope != 1.0) return null;
     final src = song.source;
     if (src == null) return null;
     final deltaSec = src.durationDelta;
@@ -1393,6 +1703,12 @@ class AppState extends ChangeNotifier {
   /// `playSong` / `playQueue` / `jumpTo` / `_resetTrack`（next/previous）
   /// 全都汇流到这一个方法，只挂一处就不会出现「某个入口切歌歌词不换」。
   void _playCurrent() {
+    // 切歌即清除上一首歌的错误提示——如果新歌也失败，_playResolved 会
+    // 用新的错误覆盖；手动匹配成功后的播放不走这里，但在 bind/switch
+    // 各自的成功路径里也会清。
+    _playbackError = null;
+    // 挂起的对齐锚点绑定旧歌/旧播放周期，切歌必须作废
+    _pendingAlign = null;
     // 歌词与音源并行加载：歌词来自 QQ音乐，音源来自 B站，互不阻塞。
     // 先发歌词请求能盖住拉流的那几百毫秒，用户看到词比听到声音早一点，
     // 观感上比「先出声、过两秒才蹦出词」自然。
@@ -1403,7 +1719,31 @@ class AppState extends ChangeNotifier {
     unawaited(_stats.flush());
 
     final p = _player;
-    final song = current;
+    var song = current;
+    // 已下载的歌优先播本地文件（用户 2026-10-11 选的语义）：省流量、秒开，
+    // 也躲开了 CDN 断流那一类毛病。判定是纯内存的（下载清单已在本地），
+    // 不能在这里等一次数据库查询——那会让每次切歌都多一个 await。
+    //
+    // 换的是**队列里那一格**，不是临时变量：播放页、通知栏、音源详情面板
+    // 都从 current 读，只换局部变量会出现「实际播文件、界面显示 B站源」。
+    if (song != null && song.id != null) {
+      final dl = _download.fileOf(song);
+      if (dl != null && song.source?.sourceType != kLocalSourceType) {
+        _replaceQueued(
+          song.id!,
+          song.copyWith(
+            source: AudioSource.localFile(
+              uri: dl.uri,
+              qualityLabel: dl.qualityId == 0
+                  ? '本地文件'
+                  : '${audioQualityLabel(dl.qualityId)} · 本地',
+              qualityId: dl.qualityId,
+            ),
+          ),
+        );
+        song = current;
+      }
+    }
     // 新歌开始，重置本次收听计数
     _stats.reset(song?.id);
     // 同步「最新点播目标」：ensurePlayableSource 的在途匹配靠它判断
@@ -1498,7 +1838,8 @@ class AppState extends ChangeNotifier {
       final repo = _repo;
       final id = target.id;
       if (repo != null && id != null) {
-        unawaited(repo.db.songs.updateLyricOffset(id, autoSeedMs));
+        unawaited(
+            repo.db.songs.updateLyricCalibration(id, offsetMs: autoSeedMs));
       }
       // 通知 UI 校准条显示新值（offset 从 0 变非 0）
       notifyListeners();
@@ -1512,8 +1853,7 @@ class AppState extends ChangeNotifier {
     try {
       // 60s 兜底：resolve / setAudioSource 在极端弱网下可能长时间不返回，
       // 不能让 resolvingSource 的转圈无限期挂着（真机实测过「一直转圈」）。
-      final err =
-          await p.playSong(target).timeout(const Duration(seconds: 60));
+      final err = await p.playSong(target).timeout(const Duration(seconds: 60));
       // 已被更新的切歌任务顶掉时静默退出——错误提示归最新一代管，
       // 否则会弹出「已切换到其他歌曲」这类用户看不懂的噪音。
       if (!mounted || gen != _playGen) return;
@@ -1618,9 +1958,28 @@ class AppState extends ChangeNotifier {
         // 「用户点了想听」与「批量预处理」语境不同——静默失败比播一个
         // 可能不太对的版本更糟。批量匹配路径保持 AUTO-only（红线不动）。
         final activated = await repo.activateBestCandidate(id);
-        if (!activated) return null;
-        // 告知用户这是自动挑选的版本，不满意可以去人工换
-        unawaited(Future.microtask(() => showToast('已自动选择最相似的音源，可在播放页「手动更换音源」调整')));
+        if (!activated) {
+          // 「真没找到」的记账（引擎在无候选时已 warn，这里覆盖的是
+          // 「有候选但激活失败」的 DB 层意外；debug 级，详细模式才可见）。
+          DiagLog.instance.d(
+            DiagCategory.match,
+            '点播兜底失败：无可激活候选',
+            {
+              'event': 'ondemand_no_candidate',
+              'songId': id,
+              'song': song.title
+            },
+          );
+          return null;
+        }
+        // 告知用户这是自动挑选的版本，不满意可以去人工换。
+        // ⚠️ 上面 activateBestCandidate 是「网络 + 落库」的 await（点播首匹配
+        // ≈20 秒），期间用户很可能已经退出。showToast 内部会 notifyListeners()
+        // 并起 Timer，dispose 后调用直接抛「used after being disposed」。
+        if (mounted) {
+          unawaited(Future.microtask(
+              () => showToast('已自动选择最相似的音源，可在播放页「手动更换音源」调整')));
+        }
       }
 
       // 必须重新读库：matchOne 只写数据库，不会改内存里的对象。
@@ -1636,9 +1995,17 @@ class AppState extends ChangeNotifier {
       // 这里 await（而不是 unawaited）是为了让调用方拿到的状态是自洽的。
       await refreshLibrary();
       return fresh;
-    } catch (_) {
+    } catch (e) {
       // 匹配失败（含被风控 / 网络异常）不该让播放抛错，
       // 交给调用方统一展示「没有找到可播放的音源」。
+      // 引擎内部异常已由 MatchEngine 自己记录（'匹配过程异常'）；
+      // 这里补的是匹配后处理（激活/回读/刷新）的异常盲区，并把
+      // 「用户可见的失败结果」与引擎日志关联起来。
+      DiagLog.instance.e(
+        DiagCategory.match,
+        '点播匹配失败：$e',
+        {'event': 'ondemand_fail', 'songId': id, 'song': song.title},
+      );
       return null;
     } finally {
       if (mounted) {
@@ -1768,14 +2135,167 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 智能混入：收藏 + 库内随机
-  void shufflePlay() {
-    final pool = <Song>{
-      ..._library.where(isLiked),
-      ..._library.take(15),
-    }.toList();
-    if (pool.isEmpty) return;
-    playQueue(pool, _rng.nextInt(pool.length));
+  // ---- 猜你想听 ----
+  //
+  // 取代原「随便听一下」（`shufflePlay`：收藏 + 曲库前 15 首随机）。
+  // 旧那套的问题是它只会回锅你库里已有的歌，听两周就永远是那十几首；
+  // 新链路按口味去 QQ 音乐拿歌手热歌 + 榜单新歌，见 state/guess_for_you.dart。
+
+  /// 推荐正在加载中（首页卡片据此转圈）。
+  bool get guessing => _guess.busy;
+
+  /// 组一批「猜你想听」并起播。返回 null = 已交给播放链路；
+  /// 返回文案 = 失败原因，由调用方用 SnackBar 如实呈现（不做假数据兜底）。
+  Future<String?> guessForYou() => _guess.run();
+
+  // ---- 歌曲目录（本地扫描范围 / 下载落点）----
+  //
+  // 三项设置里的「目录」相关状态，实现与失效语义都在 state/music_dirs.dart，
+  // 这里只做同名转发（与其它子模块一致）。
+
+  /// 启动时核对已存目录的授权是否还在。main.dart 里 unawaited 调用。
+  Future<void> restoreMusicDirs() => _dirs.restore();
+
+  /// 最近一次核对/选择得到的提示（授权失效、提供方不支持持久化等）。
+  String? get dirsNote => _dirs.note;
+
+  String musicDirTrailing(MusicDirKind kind) => _dirs.trailingOf(kind);
+
+  /// 这一项当前有没有值（UI 据此决定「直接去选」还是「先问换/清」）。
+  bool musicDirSet(MusicDirKind kind) => _dirs.isSet(kind);
+
+  String musicDirSubtitle(MusicDirKind kind) => _dirs.subtitleOf(kind);
+
+  Future<String?> pickMusicDir(MusicDirKind kind) => _dirs.pick(kind);
+
+  Future<String?> clearMusicDir(MusicDirKind kind) => _dirs.clear(kind);
+
+  /// 下载落点当前是否真能用（第三阶段的下载按钮据此决定可否点击）。
+  bool get downloadDirUsable => _dirs.downloadUsable;
+
+  /// 本地扫描的路径前缀；null = 全盘。
+  String? get localScanPath => _dirs.localScanPath;
+
+  // ---- 本机音频（自带扫描 + app 下载）----
+  //
+  // 两份清单在产品上是两个入口，在数据上是同一张表的两个 kind。
+  // 这里只转发，任何一处把两者合并展示都会破坏「两个目录隔开」的约定。
+
+  List<LocalAudioEntry> get localTracks => _local.localTracks;
+  List<LocalAudioEntry> get downloadedTracks => _local.downloadedTracks;
+  int get localCount => _local.localCount;
+  int get downloadCount => _local.downloadCount;
+  bool get localScanning => _local.scanning;
+  int get lastLocalScanAt => _local.lastScanAt;
+
+  /// 读两份清单（不发网络请求）。曲库加载完成后调一次。
+  Future<void> loadLocalLibrary() => _local.load();
+
+  /// 本机/下载清单是否正在补全线上身份（封面与歌词共用这一条链路）。
+  bool get localMetaSyncing => _local.metaSyncing;
+
+  /// 后台补全本机清单的线上身份：换到了就有真实封面和歌词。
+  ///
+  /// 由「进入本机/下载列表」触发，**不阻塞界面**：分片打元数据源，每片
+  /// 落库后刷一次清单，用户看到的是封面一首一首变真。已经在跑就直接返回，
+  /// 反复进出页面不该叠出一串请求。
+  /// 换不到身份的歌会写 `resolved_at` 冷却；断网时连续几首请求异常就收手，
+  /// 剩下的下次进页面再试。
+  Future<int> syncLocalMeta({int limit = 60}) =>
+      _local.syncMissingMeta(limit: limit);
+
+  /// 用本机清单换到的封面**就地补齐**队列里的本机歌。
+  ///
+  /// 只填 coverUrl / albumMid，而且只在原来为空时填：队列元素上还挂着
+  /// `lyricOffsetMs` 这类运行时校准值，整体替换会把用户刚调好的歌词对齐冲掉
+  /// （对比 [_syncQueueWithLibrary]，那条走曲库行，字段齐全所以能整换）。
+  void _syncQueueCoverWithLocalLibrary() {
+    if (_queue.isEmpty) return;
+    for (var i = 0; i < _queue.length; i++) {
+      final s = _queue[i];
+      final src = s.source;
+      if (src == null || src.sourceType != 'local') continue;
+      final url = s.coverUrl;
+      if (url != null && url.isNotEmpty) continue;
+      final entry = _local.entryByUri(src.sourceKey);
+      if (entry == null || entry.albumMid.isEmpty) continue;
+      final fresh = localEntryToSong(entry);
+      final cover = fresh.coverUrl;
+      if (cover == null || cover.isEmpty) continue;
+      _queue[i] = s.copyWith(coverUrl: cover, albumMid: fresh.albumMid);
+    }
+  }
+
+  /// 本机歌补到的线上 songMid；非本机歌返回 null（它们走曲库行取 mid）。
+  String? _localSongMid(Song song) {
+    final src = song.source;
+    if (src == null || src.sourceType != 'local') return null;
+    return _local.songMidByUri(src.sourceKey);
+  }
+
+  /// 扫一次手机自带音频。返回 null = 正常；返回文案 = 需要告诉用户的事。
+  Future<String?> scanLocalAudio() => _local.scan();
+
+  /// 从「下载」清单里去掉一条记录（不动手机上的文件）。
+  Future<void> forgetDownload(int id) => _local.forgetDownload(id);
+
+  // ---- 播放页下载 ----
+  //
+  // 按钮的三态、在途任务、失败原因都由 DownloadBox 管（见其文件头）。
+
+  /// 播放页那个按钮该显示成什么样。
+  DownloadUi downloadUi(Song song) => _download.uiOf(song);
+
+  /// 这首歌是否已经下载到本机。
+  bool isDownloaded(Song song) => _download.isDownloaded(song);
+
+  /// 开始下载当前这首歌。返回 null = 已受理；返回文案 = 没开始的原因。
+  Future<String?> startDownload(Song song) => _download.start(song);
+
+  /// 取消在途下载。
+  Future<String?> cancelDownload() => _download.cancel();
+
+  /// 移除已下载（删文件 + 删记录）。
+  Future<String?> removeDownload(Song song) => _download.remove(song);
+
+  /// 重试（失败态下按钮那句「重试」）。清掉失败标记后重新发起。
+  Future<String?> retryDownload(Song song) async {
+    await _download.resetFailed();
+    return _download.start(song);
+  }
+
+  /// 从本机音频列表点歌播放。
+  ///
+  /// 队列仍然遵守「= 用户点击时所在上下文的全量列表」这条红线：整份
+  /// [entries] 映射成 Song 后作为队列，沿列表顺序上下切。
+  /// 本机文件不需要匹配音源，Song 直接带一个 [AudioSource.localFile]，
+  /// 解析层见到 local 类型就用 uri，一次请求都不发。
+  void playLocalTrack(
+    LocalAudioEntry entry, {
+    required List<LocalAudioEntry> source,
+  }) {
+    final songs = source.map(localEntryToSong).toList();
+    // 按 uri 定位，不按 song.key（title|artist）：本机文件常见同名两版
+    // （同一首歌的 128K 与 320K），按 key 找会播错那一版。
+    final i = songs.indexWhere(
+      (s) => s.source?.sourceKey == entry.uri,
+    );
+    playQueue(songs, i < 0 ? 0 : i);
+    // 还没换到线上身份 → 单补这一首，不排在整批后面。补成功后清单回调
+    // onChange 会把封面回填进队列；歌词必须在这里显式重取一次，因为
+    // playQueue 里那次 loadLyricForCurrent 是带着空 mid 跑的（必然没词）。
+    if (entry.songMid.isEmpty) {
+      unawaited(_resolveMidForPlaying(entry));
+    }
+  }
+
+  /// 给一条本机歌补线上身份，补到了且它还在播 → 重取歌词。
+  Future<void> _resolveMidForPlaying(LocalAudioEntry entry) async {
+    final ok = await _local.resolveOne(entry);
+    if (!ok || !mounted) return;
+    // 补全期间用户可能已经切歌，别把歌词刷到另一首上
+    if (current?.source?.sourceKey != entry.uri) return;
+    unawaited(loadLyricForCurrent(force: true));
   }
 
   /// 切换收藏。
@@ -1784,12 +2304,23 @@ class AppState extends ChangeNotifier {
   /// 真实模式下要写库（`liked_song` 表）。写法上先**乐观更新内存、
   /// 再落库**——红心必须在手指抬起的瞬间就变，等磁盘 IO 会让点击发飘。
   /// 落库失败才回滚（极少见，但静默失败会让用户以为收藏了其实没有）。
+  ///
+  /// ## 没有 song 行的歌不收（2026-10-11 决定）
+  /// 本机扫描出来的文件在 `song` 表里没有行（id 为 null），收藏没有载体。
+  /// 旧实现把这种红心塞进内存集合，于是「计数 +1、重启就掉、收藏列表里
+  /// 又没有它」——一个只活在本次会话里的假收藏比明说不能收藏更糟。
+  /// 现在如实给一句话，不动任何状态。
   Future<void> toggleLike(Song s) async {
     final repo = _repo;
     final id = s.id;
 
+    if (repo != null && id == null) {
+      showToast('「${s.title}」是本机文件，还没入库，暂时不能收藏');
+      return;
+    }
+
     // 乐观更新
-    final wasLiked = _likedKeys.contains(s.key);
+    final wasLiked = isLiked(s);
     if (wasLiked) {
       _likedKeys.remove(s.key);
       if (id != null) _likedIds.remove(id);
@@ -1817,6 +2348,7 @@ class AppState extends ChangeNotifier {
         if (mounted) notifyListeners();
       }
     } catch (_) {
+
       // 落库失败：回滚到操作前，否则用户以为收藏成功了
       if (wasLiked) {
         _likedKeys.add(s.key);
@@ -1858,13 +2390,16 @@ class AppState extends ChangeNotifier {
   /// [index] 是用户点的那首在 [items] 里的位置；入库去重后位置可能
   /// 前移（重复项被去掉），所以这里按 key 对齐而不是直接沿用 index：
   /// 找不到时（理论上不会）退化为从第一首开始播。
-  Future<void> playOnline(List<OnlineSong> items, int index) async {
+  ///
+  /// 返回 false 表示「一条也没能走起来」（数据层未接入 / 入库全空），
+  /// 调用方据此决定要不要给用户报错——「猜你想听」就是这么判断的。
+  Future<bool> playOnline(List<OnlineSong> items, int index) async {
     final repo = _repo;
-    if (repo == null || items.isEmpty) return;
+    if (repo == null || items.isEmpty) return false;
     final targetKey = items[index.clamp(0, items.length - 1)].song.key;
 
     final songs = await repo.persistOnline(items);
-    if (songs.isEmpty) return;
+    if (songs.isEmpty) return false;
 
     // 曲库列表、统计数要跟上，否则「我的」页显示的还是旧数量，
     // 用户会以为入库没发生（真机上就出现了 3 首没变的情况）。
@@ -1872,6 +2407,7 @@ class AppState extends ChangeNotifier {
 
     final start = songs.indexWhere((s) => s.key == targetKey);
     playQueue(songs, start < 0 ? 0 : start);
+    return true;
   }
 
   void openPlayer() {
@@ -1929,7 +2465,6 @@ class AppState extends ChangeNotifier {
   /// 清空在线搜索结果（关闭搜索页 / 清空输入时）
   void clearOnlineResults() => _search.clearResults();
 
-
   void toggleTheme() {
     _themeMode = isDark ? ThemeMode.light : ThemeMode.dark;
     // 落盘：下次冷启动按这个模式起（不落盘 = 每次都回浅色）
@@ -1942,8 +2477,16 @@ class AppState extends ChangeNotifier {
     _sleepTimer = d;
     if (d != null) {
       _sleepTicker = Timer(d, () {
+        // ⚠️ 这里**必须**真正暂停播放器，不能只翻 _playing 标志位。
+        // 之前只写 `_playing = false`，真机上音频会一直放到自然结束，
+        // 而界面却显示成暂停态：playingStream 是**变更流**，只在状态变化时
+        // 补发，自此不再回调 true → `_playing` 与 just_audio 永久失步，
+        // 播放按钮再也按不动（只能去通知栏停）。顺带把播放时长结掉，
+        // 否则这一段在「最近播放 / 常听」里要等到切歌才入账。
+        if (_playing) unawaited(_stats.flush());
         _playing = false;
         _ticker?.cancel();
+        unawaited(_player?.pause() ?? Future<void>.value());
         _sleepTimer = null;
         notifyListeners();
       });
@@ -1954,6 +2497,9 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    // 注销原生进度回调：留着它，下一次 attach 的下载会把进度推给
+    // 这个已死的 AppState，在 super.dispose 之后 notifyListeners 必崩。
+    _download.dispose();
     _ticker?.cancel();
     _sleepTicker?.cancel();
     _toastTimer?.cancel();

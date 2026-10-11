@@ -25,6 +25,7 @@ import 'package:audio_service/audio_service.dart';
 import 'package:just_audio/just_audio.dart' as ja;
 
 import '../../models/models.dart';
+import '../diag/diag_log.dart';
 import '../fx/audio_fx_service.dart';
 import '../playback/source_resolver.dart';
 
@@ -47,6 +48,81 @@ MediaItem _toMediaItem(Song song) => MediaItem(
       artUri: song.coverUrl == null ? null : Uri.tryParse(song.coverUrl!),
     );
 
+/// 停滞看门狗的判定逻辑（纯状态机，无 I/O，可独立单测）。
+///
+/// ## 为什么需要它（2026-10-07 魅族 21 实测确诊）
+/// Flyme 的后台网络封锁会在暂停/熄屏后掐断 CDN 拉流：播放键恢复后
+/// ExoPlayer 状态是 PLAYING、无任何报错，但 position 原地冻结——
+/// 「假播放」。这种死流不触发 403/异常，只能靠位置读数发现。
+///
+/// 判定规则：playing 期间每 2s 读一次 position，连续
+/// [stallThreshold] 次位移 < 500ms 判为停滞，请求自愈；自愈成功次数
+/// 超过 [maxReviveAttempts] 后放弃（典型即 ROM 断网，重试只会白烧
+/// playurl 配额），等下一次人工 play / 切歌重整旗鼓。
+class StallWatchdog {
+  StallWatchdog({
+    this.stallThreshold = 5,
+    this.maxReviveAttempts = 3,
+  });
+
+  /// 连续多少个 tick（tick 周期 2s）位置不动才判死。
+  /// 5 × 2s = 10s：短于它会误伤弱网下的正常缓冲，长于它用户已经切走了。
+  final int stallThreshold;
+
+  /// 一段播放周期内最多自愈几次。
+  final int maxReviveAttempts;
+
+  Duration? _lastPos;
+  int _stallTicks = 0;
+  int _reviveAttempts = 0;
+
+  /// 已完成的本次周期内自愈次数（诊断日志用）
+  int get attempts => _reviveAttempts;
+
+  /// 记账一次自愈（控制器在真正发起重载前调用）
+  void countRevive() => _reviveAttempts++;
+
+  /// 自愈次数用尽：再判停滞也不重试，等 [resetAttempts] 后才恢复
+  bool get exhausted => _reviveAttempts >= maxReviveAttempts;
+
+  /// 开始新的播放周期（人工播放/切歌）：自愈预算清零。
+  /// 自愈内部走的 playSong（控制器里以 `_reviving` 标记）会跳过这里，
+  /// 防止预算被自愈自己的重载偷偷回满、变成无限循环。
+  void resetAttempts() {
+    _reviveAttempts = 0;
+    _stallTicks = 0;
+    _lastPos = null;
+  }
+
+  /// 自愈重载期间/之后调用：作废位置基线与连击计数。
+  /// 重载后位置会跳变（回到 resumePos），旧基线比对无意义。
+  void suspend() {
+    _stallTicks = 0;
+    _lastPos = null;
+  }
+
+  /// 喂一次位置读数。返回 true 表示停滞已达标、应触发自愈。
+  ///
+  /// [playing] = false（暂停/空载）时清零基线直接返回：暂停时位置
+  /// 不动是正常的，绝不能攒停滞计数。
+  bool tick({required bool playing, required Duration position}) {
+    if (!playing) {
+      _stallTicks = 0;
+      _lastPos = null;
+      return false;
+    }
+    final prev = _lastPos;
+    _lastPos = position;
+    // seek / 回环造成的跳变（含倒退）都算「流是活的」
+    if (prev != null && (position - prev).abs() > const Duration(milliseconds: 500)) {
+      _stallTicks = 0;
+      return false;
+    }
+    _stallTicks++;
+    return _stallTicks >= stallThreshold;
+  }
+}
+
 class AudioPlayerController extends BaseAudioHandler with SeekHandler {
   /// [fx] 缺省取 [AudioFxService.instance] 单例。省略参数让
   /// `AudioService.init(builder: AudioPlayerController.new)` 的 tearoff
@@ -58,7 +134,10 @@ class AudioPlayerController extends BaseAudioHandler with SeekHandler {
       : _fx = fx ?? AudioFxService.instance,
         _player = ja.AudioPlayer(
           audioPipeline: _buildPipeline(fx ?? AudioFxService.instance),
-        );
+        ) {
+    // 停滞看门狗：常驻 2s 一拍，自身不做任何判定外动作，见 _watchdogTick。
+    _stallTimer = Timer.periodic(const Duration(seconds: 2), (_) => _watchdogTick());
+  }
 
   static ja.AudioPipeline _buildPipeline(AudioFxService fx) {
     // 音效经 AudioPipeline 注入：just_audio 内部有平台守卫（非 Android
@@ -114,6 +193,37 @@ class AudioPlayerController extends BaseAudioHandler with SeekHandler {
   Future<void> Function()? onSkipToNext;
   Future<void> Function()? onSkipToPrevious;
 
+  /// 「播放键来了但本类完全不记得在放什么」时的兜底回调，由 AppState 注入。
+  ///
+  /// ## 什么时候会走到这一步
+  /// 进程被系统杀死后，MediaButtonReceiver 冷唤醒引擎：main() 重跑、
+  /// [AudioService.init] 重建本类——`_current` 为 null、无音源，但
+  /// AppState 的会话恢复已把队列和待续播进度备好。此时播放键必须
+  /// 委托回应用内同一条恢复链路（togglePlay 的空源分支），否则锁屏
+  /// 卡片上的播放键就是死的（真机/魅族 21 实测）。
+  Future<void> Function()? onColdPlay;
+
+  // ── 停滞看门狗（后台断流自愈，见 StallWatchdog 类注释）──────────
+  Timer? _stallTimer;
+  final StallWatchdog _watchdog = StallWatchdog();
+
+  /// [bind] 里那两个 just_audio 流的订阅句柄。
+  ///
+  /// 之前直接 `.listen(...)` 把返回值丢了，于是**没有任何取消入口**：
+  /// 本类的 [dispose] 即使被调用也只停了看门狗 Timer，订阅仍在收事件、
+  /// 继续往已经 dispose 的 playbackState / handler 推数据。这里存起来
+  /// 才能真正释放（并且用 `??=` 让 [bind] 可重复调用而不重复订阅）。
+  StreamSubscription<ja.PlaybackEvent>? _stateSub;
+  StreamSubscription<ja.ProcessingState>? _procStateSub;
+
+  /// [shutdown] 的幂等标志：重复调用无副作用。
+  bool _disposed = false;
+
+  /// true = 看门狗正在重载音源自愈。重载内部走 playSong，用这个标记
+  /// 让 playSong 跳过 watchdog.resetAttempts（否则自愈预算永远回不满，
+  /// 后台断网时 3 次上限形同虚设，playurl 会被无限重放）。
+  bool _reviving = false;
+
   /// 当前这首歌实际解析到的音质（通知栏/详情面板可读）
   int currentQualityId = 0;
   int currentBandwidth = 0;
@@ -137,13 +247,13 @@ class AudioPlayerController extends BaseAudioHandler with SeekHandler {
   /// ⚠️ 这一步不能省：`playbackState` 是通知栏/锁屏的数据源，
   /// 不转发的话系统只知道「有声在响」，按钮状态全是错的。
   void bind() {
-    _player.playbackEventStream.listen(
+    _stateSub ??= _player.playbackEventStream.listen(
       _broadcastState,
       onError: (Object e, StackTrace st) => onPlaybackError?.call(e),
     );
 
     // 播放自然结束 → 交给上层决定下一首（尊重 PlayMode）
-    _player.processingStateStream.listen((state) {
+    _procStateSub ??= _player.processingStateStream.listen((state) {
       if (state == ja.ProcessingState.completed) {
         onTrackEnded?.call();
       }
@@ -198,10 +308,20 @@ class AudioPlayerController extends BaseAudioHandler with SeekHandler {
   /// 解析音源并开始播放。
   ///
   /// 返回 null 表示成功；非 null 是给用户看的错误文案。
-  Future<String?> playSong(Song song, {bool forceRefresh = false}) async {
+  ///
+  /// [initialPosition]：装载完成后从该进度起播（看门狗自愈用——死流
+  /// 重载必须原地复活，从头播会把用户的进度丢掉）。普通播歌不传。
+  Future<String?> playSong(
+    Song song, {
+    bool forceRefresh = false,
+    Duration? initialPosition,
+  }) async {
     final r = resolver;
     if (r == null) return '播放器未初始化';
 
+    // 外部发起的播放 = 新的看门狗周期，自愈预算回满。
+    // 自愈自己走的 playSong 由 _reviving 拦下，防止预算被自己回满。
+    if (!_reviving) _watchdog.resetAttempts();
     final gen = ++_playSongGen;
     _current = song;
     // 装载开始：旧源已随上一次 stopForSwitch / cancelLoad 清掉，
@@ -247,11 +367,23 @@ class AudioPlayerController extends BaseAudioHandler with SeekHandler {
 
       // ★ 关键：CDN 拉流可能需要请求头（B站要 Referer）
       // 从 resolver.sourceHeaders 读，不再硬编码 bilibili.com
+      //
+      // ⚠️ **本机文件不能带 headers**（2026-10-11 真机确诊）。
+      // just_audio 一旦收到 headers 就把流改走它自己的 Dart 端代理
+      // （_proxyHandlerForUri → _HttpClient.getUrl），而 HttpClient 只认
+      // http/https——content:// 直接抛
+      //   Invalid argument(s): Unsupported scheme 'content' in URI
+      //   content://media/external/audio/media/xxxx
+      // 表现就是「本地/下载的歌曲点开没声」。本机文件本来也不需要任何头，
+      // 所以按 uri 的 scheme 决定传不传，而不是无脑传。
+      final url = Uri.parse(res.url!);
+      final needsHeaders = url.scheme == 'http' || url.scheme == 'https';
       await _player.setAudioSource(
         ja.AudioSource.uri(
-          Uri.parse(res.url!),
-          headers: r.sourceHeaders,
+          url,
+          headers: needsHeaders ? r.sourceHeaders : null,
         ),
+        initialPosition: initialPosition,
       );
       // 装载成功：从这一刻起播放器「有源」，play() 的空态守卫放行
       _sourceLoaded = true;
@@ -279,17 +411,89 @@ class AudioPlayerController extends BaseAudioHandler with SeekHandler {
 
   @override
   Future<void> play() async {
-    // 空播放器（初始 / 切歌后 / 解析失败后）忽略播放请求。
-    // 原因有二：① 没有音源可播，出声是不可能的；② just_audio 对空
-    // playlist 的 play() 会先把 playing 置 true 再挂起——不拦的话，
+    // 人工按下播放 = 新的看门狗周期（自愈预算回满）
+    _watchdog.resetAttempts();
+    // 空播放器（初始 / 切歌后 / 解析失败后）没有音源可播，just_audio 对
+    // 空 playlist 的 play() 会先把 playing 置 true 再挂起——不拦的话，
     // 通知栏/界面会显示「播放中」却永远无声的假播放态。
-    // 有源的暂停态不受影响，正常透传给 just_audio。
-    if (!_sourceLoaded) return;
+    //
+    // 但不能纯静默：解析失败后通知栏仍挂着这首歌、按钮是「播放」，
+    // 静默 return 会造成「通知栏播放键点了没反应」的死角。此时只要
+    // 还记得当前歌，就重走 playSong 自愈（默认不 forceRefresh：多数
+    // 失败是 URL 过期，resolver 内部本就会重匹配；正在切歌/解析中则
+    // 不掺和，避免代次竞争把新歌顶掉）。
+    if (!_sourceLoaded) {
+      if (!_isResolving) {
+        final song = _current;
+        if (song != null && resolver != null) {
+          // 还记得当前歌：重走 playSong 自愈（默认不 forceRefresh：
+          // 多数失败是 URL 过期，resolver 内部本就会重匹配）。
+          await playSong(song);
+        } else {
+          // 冷启动/全新会话：委托 AppState 的恢复接力（续播/重播）。
+          await onColdPlay?.call();
+        }
+      }
+      return;
+    }
     await _player.play();
   }
 
   @override
   Future<void> pause() => _player.pause();
+
+  // ── 停滞看门狗（后台断流自愈）────────────────────────────
+
+  /// 看门狗心跳：只在「真实出声中」判断位置是否冻结（判定规则见
+  /// [StallWatchdog]）。判死后用同一条 URL 重装音源自愈——停滞的本质
+  /// 是旧 CDN 连接死透且 ExoPlayer 已放弃重试，重开一条新连接即可复活；
+  /// URL 本身被吊销的情形会以 403 异常暴露，走 onPlaybackError 的强制
+  /// 重解析路径，不归这里管。
+  void _watchdogTick() {
+    // 没在真实出声（空载/装载中/重载中/暂停/已播完）时不做任何判定。
+    // 特别注意 completed：曲目自然播完后 position 冻结在末尾是正常的，
+    // 绝不能判成死流把已结束的歌原地复活。
+    if (!_sourceLoaded ||
+        _reviving ||
+        !_player.playing ||
+        _player.processingState == ja.ProcessingState.completed) {
+      return;
+    }
+    if (!_watchdog.tick(playing: true, position: _player.position)) return;
+    _watchdog.suspend();
+    if (_watchdog.exhausted) {
+      // 连续自愈仍停滞（典型：ROM 掐断后台网络）。放弃到下一次人工
+      // play / 切歌为止，避免每 10s 白烧一次 playurl 配额。
+      return;
+    }
+    _watchdog.countRevive();
+    unawaited(_reviveStalledStream());
+  }
+
+  /// 自愈：记下停滞进度 → 重装音源 → 从原进度起播。
+  /// 不 forceRefresh：缓存 URL 只要还在有效期内就是好的，重开会话
+  /// （新 TCP/TLS）才是对症的药；顺带省一次 playurl 配额。
+  Future<void> _reviveStalledStream() async {
+    final song = _current;
+    if (song == null || resolver == null) return;
+    final resumePos = _player.position;
+    DiagLog.instance.w(
+      DiagCategory.playback,
+      '播放停滞，看门狗重载音源：${song.key} @${resumePos.inMilliseconds}ms',
+      {
+        'event': 'stall_watchdog',
+        'songKey': song.key,
+        'positionMs': resumePos.inMilliseconds,
+        'attempt': _watchdog.attempts,
+      },
+    );
+    _reviving = true;
+    try {
+      await playSong(song, initialPosition: resumePos);
+    } finally {
+      _reviving = false;
+    }
+  }
 
   /// 通知栏 / 线控 / 蓝牙的切歌请求 → 交给 AppState 的 next/previous
   /// （尊重播放模式：单曲循环重播、随机乱序），与界面按钮同一条链路。
@@ -393,11 +597,41 @@ class AudioPlayerController extends BaseAudioHandler with SeekHandler {
   Future<void> onTaskRemoved() async {
     if (!_player.playing) {
       await stop();
+      // 非播放态被划掉 = 前台 Service 要停Self。这时候把资源一并释放：
+      // 播放态不能这么做（会掐断正在放的歌），但这时也没有正在放的东西，
+      // 留着看门狗 Timer 和流订阅只是白白占着进程。
+      await shutdown();
     }
     await super.onTaskRemoved();
   }
 
-  Future<void> dispose() async {
+  /// 释放自身持有的资源（看门狗 Timer、just_audio 流订阅、播放器）。
+  ///
+  /// ## 生命周期与调用方
+  /// 本类是 **AudioService 持有的单例**：它的生命周期跟前台 Service 走，
+  /// 比界面（AppState）长得多。`main.dart` 刻意**不**调它 —— 界面被划掉
+  /// 时音频还要继续放，这里 dispose 就等于把后台播放掐了。
+  ///
+  /// 真正的调用点是 audio_service 的 [onTaskRemoved] 之外的 Service 销毁
+  /// 路径：`BaseAudioHandler` 没有 dispose 钩子，但 audio_service 在
+  /// 自定义 `stop()` / Service 被真正销毁时会调 `onTaskRemoved`。
+  /// 因此这里同时提供 [shutdown]：把「停 Service」和「释放资源」串成
+  /// 一条不会漏的路，且**可重入**（重复调用无副作用）。
+  ///
+  /// 之前有一个 `dispose()`，但它是**死代码**（lib/ 内无任何调用点），
+  /// 后果是 2 秒看门狗 Timer 与两个流订阅没有任何回收路径。
+  Future<void> shutdown() async {
+    if (_disposed) return;
+    _disposed = true;
+
+    _stallTimer?.cancel();
+    _stallTimer = null;
+
+    await _stateSub?.cancel();
+    _stateSub = null;
+    await _procStateSub?.cancel();
+    _procStateSub = null;
+
     await _resolving.close();
     await _player.dispose();
   }

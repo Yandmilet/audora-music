@@ -53,6 +53,8 @@ dev_dependencies:
     sdk: flutter
   # 单测里用 sqlite3 的内存库跑 DAO（真机走 sqflite 原生实现，不用这个包）
   sqflite_common_ffi: ^2.4.3
+  # tool/eval_match_samples.dart 直读导出的 audora.db（Windows 走系统 winsqlite3.dll）
+  sqlite3: ^3.6.0
 hooks:
   user_defines:
     sqlite3:

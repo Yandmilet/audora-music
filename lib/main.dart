@@ -13,6 +13,7 @@ import 'services/bilibili/bili_api.dart';
 import 'services/bilibili/bili_api_client.dart';
 import 'services/diag/diag_log.dart';
 import 'services/fx/audio_fx_service.dart';
+import 'services/lyric/amll_ttml_provider.dart';
 import 'services/match/match_engine.dart';
 import 'services/net/rate_limiter.dart';
 import 'services/netease/netease_provider.dart';
@@ -220,12 +221,21 @@ class _AudoraAppState extends State<AudoraApp> with WidgetsBindingObserver {
           // 改了会被系统当成一个全新的媒体应用，旧的通知栏控制会失效。
           androidNotificationChannelId: 'com.fly1pu.audoramusic.audio',
           androidNotificationChannelName: 'Audora 播放',
-          // 播放中通知设为 ongoing（不可下滑划掉）：划掉通知会触发
-          // onNotificationDeleted → stop()，等于把后台播放连同控制入口
-          // 一起毁掉。暂停态下 audio_service 自动放开 ongoing，用户
-          // 听完不想听了可以从通知栏划掉来停止播放。
-          androidNotificationOngoing: true,
-          androidStopForegroundOnPause: true,
+          // 通知 ongoing 由前台服务本身保证：暂停时服务保持前台
+          // （见下），系统对 FGS 通知强制 ongoing，不可划掉。想停止
+          // 播放走通知栏的「停止」按钮（第四个溢出键）。
+          // （androidNotificationOngoing 只在 stopForegroundOnPause=true
+          // 时才生效，构造断言也这么要求，故这里保持默认 false。）
+          //
+          // ⚠️ 暂停时服务必须保持前台，绝不能 detach（Flyme/魅族 21 实测）：
+          // 开启 stopForegroundOnPause 后，暂停 → 恢复一个来回，Flyme 的
+          // NotificationManagerService 不会把重新 startForeground 的通知
+          // 恢复成前台态（flags 里 FOREGROUND_SERVICE 永久丢失），系统媒体
+          // 轮播随之多出一张「"Audora" 正在运行」的空幽灵卡片；且暂停期间
+          // 服务退居后台、唤醒锁也释放，会被魅族激进查杀——锁屏卡片上的
+          // 播放键点了没反应（进程已死）。代价只是暂停时多占一个前台位，
+          // 原生音乐 App（PowerAMP 等）均如此。
+          androidStopForegroundOnPause: false,
         ),
       );
       player.bind();
@@ -276,6 +286,9 @@ class _AudoraAppState extends State<AudoraApp> with WidgetsBindingObserver {
         metadata: qqAdapter,
         // 仅用于补非华语歌的中文译文，拿不到就降级成只有原文
         netease: NeteaseProvider(),
+        // 仅用于补**逐字**时间轴（QQ/网易匿名接口都不给字轴）。
+        // 命中约一半热门歌；没命中就退回逐行 + 本地均分，功能不降级为报错。
+        amll: AmllTtmlProvider(),
       );
 
       // Resolver 需要 repo（失效时自动重匹配），repo 不依赖 Resolver，
@@ -295,7 +308,7 @@ class _AudoraAppState extends State<AudoraApp> with WidgetsBindingObserver {
           final cid = await repo.refreshSourceCid(sourceKey);
           return cid?.toString();
         },
-        qualityCeiling: settings.quality.id,
+        qualityCeiling: settings.onlineQuality.id,
       );
 
       final st = AppState(
@@ -311,6 +324,10 @@ class _AudoraAppState extends State<AudoraApp> with WidgetsBindingObserver {
         player.resolver?.qualityCeiling = st.qualityCeilingId;
       });
       await st.loadLibrary();
+      // 歌曲目录的授权要开机核对一次：用户在系统设置里撤销过的话，
+      // 本地存的那串 uri 看着还在、实际已经不能用了。不阻塞启动，
+      // 设置页先显示「检查中…」，问完再落成真实状态。
+      unawaited(st.restoreMusicDirs());
       // 会话恢复：曲库就绪后按上次的歌 key 在队列里找回播放位置。
       // 主题 / tab 的恢复在 AppState 构造里已完成（不依赖曲库）。
       await st.restoreSession();
@@ -332,8 +349,10 @@ class _AudoraAppState extends State<AudoraApp> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     _st?.dispose();
     // 播放器由 AudioService 托管，其生命周期与前台 Service 绑定，
-    // 这里不主动 dispose —— 否则从最近任务划掉应用时会立即停止播放，
+    // 这里不主动 shutdown —— 否则从最近任务划掉应用时会立即停止播放，
     // 而后台播放的意义恰恰是"划掉界面还继续放"。
+    // 释放走的是 AudioPlayerController.onTaskRemoved：只在**非播放态**
+    // 被划掉时才停 Service 并 shutdown（那时没有正在放的歌）。
     super.dispose();
   }
 

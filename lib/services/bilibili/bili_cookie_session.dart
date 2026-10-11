@@ -84,6 +84,23 @@ class BiliCookieSession {
   bool get hasUserSession =>
       _userCookieHeader != null || _sessdata != null;
 
+  /// 只作废**匿名指纹**缓存，**保留用户登录态**（SESSDATA / Cookie 串）。
+  ///
+  /// ## 为什么不能直接用 setUserSession()
+  /// `setUserSession()` 无参调用会把 [_sessdata] 与 [_userCookieHeader]
+  /// 双双置 null —— 那是 `logout()` 的语义。而风控（-412/-352）的本意
+  /// 只是「匿名指纹这台机器的指纹被风控盯上了，换一组重来」，
+  /// 跟用户有没有登录是两回事。原先直接在风控分支调无参
+  /// setUserSession()，结果一次普通限流就把用户静默踢回匿名，
+  /// 丢掉 192K 音质，界面还给不出任何提示。
+  ///
+  /// -412 是 IP 维度拦截，换 Cookie 换不掉（见 docs/design-notes.md），
+  /// 所以清掉匿名缓存、下次重新取指纹本来就是这条路径能做的全部。
+  void invalidateAnonymousCookie() {
+    _cached = null;
+    _cachedAt = null;
+  }
+
   /// 取当前可用的 Cookie；登录态优先，否则匿名。
   Future<BiliCookies> effectiveCookies() async {
     if (_userCookieHeader != null) {

@@ -15,6 +15,7 @@ import 'dart:math';
 
 import '../../models/models.dart';
 import '../../services/bilibili/bili_dto.dart';
+import '../../services/lyric/amll_ttml_provider.dart';
 import '../../services/lyric/lrc_parser.dart';
 import '../../services/lyric/lyric_translation.dart';
 import '../../services/match/match_config.dart';
@@ -24,6 +25,7 @@ import '../../services/net/rate_limiter.dart' show mapWithConcurrency;
 import '../../services/netease/netease_provider.dart';
 import '../db/app_database.dart';
 import '../db/dao/binding_dao.dart';
+import '../db/dao/local_audio_dao.dart';
 import '../db/dao/song_dao.dart' show ExcludeScope;
 import '../db/dao/video_dao.dart';
 import '../db/dao/play_stats_dao.dart';
@@ -70,7 +72,7 @@ class SongWithSource {
   bool get playable => source != null;
 }
 
-/// 一首歌的歌词素材（原文 + 可选译文）。
+/// 一首歌的歌词素材（原文 + 可选译文 + 可选逐字轨）。
 ///
 /// 拆成 bundle 而不是让 `fetchLyric` 直接返回解析好的 [ParsedLyric]：
 /// 数据层不该依赖"怎么显示"，解析归 UI 层的 AppState 管。
@@ -84,14 +86,30 @@ class LyricBundle {
   /// 译文来源：'qq'（官方 trans 字段）/ 'netease'（网易 tlyric）/ null（无译文）
   final String? translationSource;
 
+  /// 逐字轨原文（AMLL TTML）。非空时它**整体替代** [lrc] 作为歌词来源。
+  ///
+  /// 为什么是「替代」而不是「把字轴合并到 LRC 上」：TTML 的行切分、文本、
+  /// 标点都是 Apple 那一套，和 QQ 的 LRC 不同源。逐行去对齐两份文本
+  /// 再搬时间轴，错一行就会让整句扫光的节奏错位——错得比没有逐字更难看。
+  /// TTML 自带 `x-translation`，译文也一起换掉，保证整首歌内部自洽。
+  final String? wordLyric;
+
+  /// 逐字轨来源标识（目前只有 'amll'），用于日志与排查
+  final String? wordSource;
+
   const LyricBundle({
     required this.lrc,
     this.translation,
     this.translationSource,
+    this.wordLyric,
+    this.wordSource,
   });
 
   bool get hasTranslation =>
       translation != null && translation!.trim().isNotEmpty;
+
+  /// 有没有真实逐字轴
+  bool get hasWordTrack => wordLyric != null && wordLyric!.trim().isNotEmpty;
 }
 
 /// 在线搜索结果的一条预览。
@@ -160,6 +178,7 @@ class LibraryRepository {
     required this.engine,
     required this.metadata,
     this.netease,
+    this.amll,
   });
 
   final AppDatabase db;
@@ -173,6 +192,9 @@ class LibraryRepository {
 
   /// 译文补充源。**可选**：不注入就只显示原文，功能降级但不报错。
   final NeteaseProvider? netease;
+
+  /// 逐字（真实字轴）歌词补充源。**可选**，理由同 [netease]。
+  final AmllTtmlProvider? amll;
 
   // ── 导入：QQ音乐元数据 → 曲库 ─────────────────────────────
 
@@ -517,6 +539,160 @@ class LibraryRepository {
   Future<void> saveTrackVolume(int songId, double volume) =>
       db.volumes.save(songId, volume);
 
+  // ── 本机音频（自带扫描 + app 下载）───────────────────────
+  //
+  // 纯转发给 LocalAudioDao：这里不加业务。唯一的例外是 [recordScanBatch]
+  // 的「同一轮扫描共用一个时间戳」——那是换血式删除正确性的前提，
+  // 放到调用方去记时刻更容易出错（漏传、两次取值之间隔了 IO）。
+
+  /// 写入一批扫描/下载结果，返回本轮用的时间戳（喂给 [pruneLocalAudio]）。
+  Future<int> recordLocalAudio(
+    List<LocalAudioEntry> entries, {
+    int? stamp,
+  }) async {
+    final now = stamp ?? DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    for (final e in entries) {
+      await db.localAudio.upsert(
+        LocalAudioEntry(
+          id: e.id,
+          kind: e.kind,
+          uri: e.uri,
+          path: e.path,
+          title: e.title,
+          artist: e.artist,
+          album: e.album,
+          durationMs: e.durationMs,
+          sizeBytes: e.sizeBytes,
+          mtimeSec: e.mtimeSec,
+          firstSeen: now,
+          lastSeen: now,
+          songId: e.songId,
+          qualityId: e.qualityId,
+        ),
+      );
+    }
+    return now;
+  }
+
+  /// 删掉这一轮没再出现的条目（仅对 local 类有意义；下载类不裁剪）。
+  Future<int> pruneLocalAudio(LocalAudioKind kind, int stamp) =>
+      db.localAudio.pruneUnseen(kind, stamp);
+
+  Future<List<LocalAudioEntry>> localAudioOf(LocalAudioKind kind) =>
+      db.localAudio.listByKind(kind);
+
+  // ── 本机文件的线上身份补全（真实封面 + 歌词）──────────────
+  //
+  // 本机文件没有 mid：`song` 表里没有它（扫描条目），或虽有 song_id 但
+  // 那行的 mid 是派生键。没有 mid 就拼不出封面 URL、歌词接口也不认。
+  // 所以补全的目标是「按 标题+歌手+时长 换回一对 mid」，换到就缓存进
+  // local_audio，之后离线也能用（URL 是派生值，图片本身另有磁盘缓存）。
+
+  static int _nowSec() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
+  /// mid 能不能拿去要歌词/封面。
+  ///
+  /// `local:` 是按标题歌手派生的兜底键、`ref:` 是调用方自带的标识（如 bvid），
+  /// 两者都**不是**元数据源的主键，喂给歌词接口只会换回 null。
+  static bool midUsable(String mid) =>
+      mid.isNotEmpty && !mid.startsWith('local:') && !mid.startsWith('ref:');
+
+  /// 还没补到身份的本机条目（补全任务的待办清单）。
+  Future<List<LocalAudioEntry>> localAudioUnresolved({int limit = 60}) =>
+      db.localAudio.unresolved(now: _nowSec(), limit: limit);
+
+  /// 缓存一份身份到某个本机文件上。
+  Future<void> resolveLocalAudio(
+    String uri, {
+    required String songMid,
+    required String albumMid,
+  }) =>
+      db.localAudio.applyResolution(
+        uri: uri,
+        songMid: songMid,
+        albumMid: albumMid,
+        now: _nowSec(),
+      );
+
+  /// 记下「这次没换到」，冷却期内不再白打请求。
+  Future<void> markLocalAudioAttempted(String uri) =>
+      db.localAudio.markResolutionAttempted(uri: uri, now: _nowSec());
+
+  /// 下载条目的身份**零请求**回填：它们回指的那首曲库歌往往已经有真 mid。
+  ///
+  /// 扫描条目（song_id 为 null）不在这里处理，交给上层走网络搜索。
+  /// 返回回填成功的条数。
+  Future<int> backfillLocalFromSongs() async {
+    final pending = await db.localAudio.unresolved(now: _nowSec(), limit: 2000);
+    var done = 0;
+    for (final e in pending) {
+      final songId = e.songId;
+      if (songId == null) continue;
+      final row = await db.songs.getById(songId);
+      final mid = row?.qqSongMid ?? '';
+      if (!midUsable(mid)) continue;
+      await db.localAudio.applyResolution(
+        uri: e.uri,
+        songMid: mid,
+        albumMid: row?.albumMid ?? '',
+        now: _nowSec(),
+      );
+      done++;
+    }
+    return done;
+  }
+
+  Future<int> localAudioCount(LocalAudioKind kind) =>
+      db.localAudio.countOfKind(kind);
+
+  /// 某首曲库的歌是否已下载到本机（「已下载优先播本地」的查询）。
+  Future<LocalAudioEntry?> downloadedFileOf(int songId) =>
+      db.localAudio.downloadedOfSong(songId);
+
+  Future<int> removeLocalAudio(int id) => db.localAudio.deleteById(id);
+
+  /// 落一条本机记录（下载完成、手动导入都走这里）。
+  ///
+  /// 下载条目在这里**顺手把曲库那首歌的身份带上**：它回指的歌通常已经有真
+  /// mid，写进新行意味着「下完就有封面、点开就有词」，不用等下次进列表才补。
+  /// 扫描条目没有 song_id，仍然走 [localAudioUnresolved] 那条网络补全路径。
+  /// （只在新行生效是有意为之：[LocalAudioDao.upsert] 的 UPDATE 分支不碰
+  /// 身份三列，避免每次重扫把用户攒下的封面清空一遍。）
+  Future<void> saveLocalAudio(LocalAudioEntry e) async {
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    var entry = e.id == null
+        ? LocalAudioEntry(
+            kind: e.kind,
+            uri: e.uri,
+            path: e.path,
+            title: e.title,
+            artist: e.artist,
+            album: e.album,
+            durationMs: e.durationMs,
+            sizeBytes: e.sizeBytes,
+            mtimeSec: e.mtimeSec,
+            firstSeen: now,
+            lastSeen: now,
+            songId: e.songId,
+            qualityId: e.qualityId,
+          )
+        : e;
+
+    final songId = entry.songId;
+    if (songId != null && !entry.hasResolvedId) {
+      final row = await db.songs.getById(songId);
+      final mid = row?.qqSongMid ?? '';
+      if (midUsable(mid)) {
+        entry = entry.withResolution(
+          songMid: mid,
+          albumMid: row!.albumMid,
+          resolvedAt: now,
+        );
+      }
+    }
+    await db.localAudio.upsert(entry);
+  }
+
   /// 一次 `IN (...)` 查回 song 行，并按 [ids] 入参顺序返回（孤儿 id 跳过）。
   ///
   /// 「常听榜」「最近播放」「收藏列表」三处共用——顺序是调用方的核心信息
@@ -567,15 +743,23 @@ class LibraryRepository {
   ///
   /// 返回 null 表示这首歌没有可用歌词（纯音乐、下架、未导入等），
   /// **不是错误**——调用方应静默留空而不是弹错。
-  Future<LyricBundle?> fetchLyric(Song song) async {
+  /// [midFallback] 给的是「曲库行里没有可用 mid」时的备胎：本机文件（扫描
+  /// 条目在 `song` 表里没有行）或那行的 mid 是 `local:`/`ref:` 派生键时，
+  /// 用调用方自己补到的线上身份去要歌词。
+  ///
+  /// 以前这里第一行是 `if (id == null) return null` —— 本机文件永远没有 id，
+  /// 于是「播本地歌看不到歌词」是写死在代码里的。现在只要 [midFallback]
+  /// 带得进一个真 songMid，本机歌和在线歌走的是同一条歌词链路。
+  Future<LyricBundle?> fetchLyric(Song song, {String? midFallback}) async {
     final id = song.id;
-    // 没有 id 说明是 mock 数据，不可能有真实歌词
-    if (id == null) return null;
-
-    final row = await db.songs.getById(id);
-    final mid = row?.qqSongMid ?? '';
-    // local: 前缀是手动录入的派生 mid，元数据源查不到
-    if (mid.isEmpty || mid.startsWith('local:')) return null;
+    var mid = '';
+    if (id != null) {
+      // 没有 id 说明是 mock 数据 / 本机扫描条目，曲库行查不到东西
+      final row = await db.songs.getById(id);
+      mid = row?.qqSongMid ?? '';
+    }
+    if (!midUsable(mid)) mid = midFallback ?? '';
+    if (mid.isEmpty) return null;
 
     final result = await metadata.fetchLyric(mid);
     final lrc = result?.lrc;
@@ -601,10 +785,35 @@ class LibraryRepository {
       }
     }
 
+    // ── 逐字轨（真实字轴）──────────────────────────────
+    //
+    // QQ 的公开歌词接口只有逐行 LRC（qrc 标志位匿名恒为 0），所以
+    // 「这首歌有没有字轴」等价于「AMLL 有没有收录这首歌」。实测热门歌
+    // 命中率约一半，命中就是真苹果逐字轴，没命中就由 UI 层做均分兜底。
+    //
+    // 放在译文之后、返回之前：逐字轨自带译文，命中后 LRC 那套整条弃用，
+    // 所以这里不关心 trans 的结果。
+    String? wordLrc;
+    String? wordSource;
+    if (amll != null) {
+      final hit = await amll!.fetchWordLyric(
+        qqMid: mid,
+        title: song.title,
+        artist: song.artist,
+        durationMs: song.duration * 1000,
+      );
+      if (hit != null) {
+        wordLrc = hit.lyric.raw;
+        wordSource = 'amll';
+      }
+    }
+
     return LyricBundle(
       lrc: lrc,
       translation: trans,
       translationSource: source,
+      wordLyric: wordLrc,
+      wordSource: wordSource,
     );
   }
 

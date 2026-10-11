@@ -7,18 +7,21 @@
 ///
 /// ## 数据纪律（与空态契约同源）
 /// 目录内容来自远端（`st.qq`），加载中就是转圈、失败就是重试，
-/// **没有任何 mock 兜底**。曲库本地为空只影响「随便听一下」，
-/// 不影响目录浏览——那本来就是两条独立的数据链。
+/// **没有任何 mock 兜底**。「猜你想听」与「最近听过」两张入口卡
+/// （2026-10-11 取代原「随便听一下」大卡）同样遵守：前者拉不到就
+/// 报一句文案，后者空着就是空列表页，不塞演示数据。
 library;
 
 import 'package:flutter/material.dart';
 
 import '../state/app_state.dart';
 import '../theme.dart';
+import '../widgets/common.dart';
 import 'home/new_songs_tab.dart';
 import 'home/playlists_tab.dart';
 import 'home/singers_tab.dart';
 import 'home/toplists_tab.dart';
+import 'song_list_page.dart';
 
 // 四个目录 tab 与远端视图骨架拆在 home/ 子目录（P3 结构整理，纯代码搬运）。
 // 这里转出测试依赖的公开符号，保证 test/ 里 import home_screen 的路径不变。
@@ -79,12 +82,52 @@ class HomeScreen extends StatelessWidget {
                 child: _SearchBar(onTap: st.openSearch),
               ),
 
-              // 随便听一下（只依赖本地曲库，有歌才出现）
-              if (st.library.isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
-                  child: _ShuffleCard(onPlay: st.shufflePlay),
+              // 两张入口卡（2026-10-11 取代原来那张「随便听一下」整行大卡）。
+              //
+              // 不再用 `st.library.isNotEmpty` 当门槛：猜你想听现在是从
+              // QQ 音乐在线组歌，空库也推得出来；最近听过空着点进去是一页
+              // 诚实的空态，比两行卡片凭空消失更好解释（也更好找到）。
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 18, 20, 0),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: EntryCard(
+                        icon: Icons.auto_awesome_rounded,
+                        title: '猜你想听',
+                        subtitle: st.guessing
+                            ? '正在按口味挑歌…'
+                            : '按你常听的歌手在线组一批',
+                        color: Tokens.brand,
+                        busy: st.guessing,
+                        onTap: () => _guessForYou(context, st),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: EntryCard(
+                        // 沿用「最近听」在个人页时的青色，换入口不换识别色
+                        icon: Icons.history_rounded,
+                        title: '最近听过',
+                        subtitle: '${st.recentlyPlayed.length} 首',
+                        color: const Color(0xFF0EA5A4),
+                        // 卡片只负责进列表，不在首页直接起播——
+                        // 「看一眼上次听到哪」和「开始放」是两件事。
+                        onTap: () => Navigator.of(context).push(
+                          MaterialPageRoute(
+                            builder: (_) => SongListPage(
+                              title: '最近听过',
+                              songs: st.recentlyPlayed,
+                              st: st,
+                              emptyText: '还没有播放记录，先挑一首听听',
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
+              ),
 
               // 目录 tabs
               Padding(
@@ -160,78 +203,17 @@ class _SearchBar extends StatelessWidget {
   }
 }
 
-class _ShuffleCard extends StatelessWidget {
-  final VoidCallback onPlay;
-  const _ShuffleCard({required this.onPlay});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(18, 17, 16, 17),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(Tokens.rLg),
-        gradient: const LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: [Color(0xFFE5484D), Color(0xFFF2708C)],
-        ),
-        boxShadow: [
-          BoxShadow(
-            color: Tokens.brand.withValues(alpha: 0.28),
-            blurRadius: 20,
-            offset: const Offset(0, 8),
-          ),
-        ],
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Row(
-                  children: [
-                    Icon(Icons.shuffle_rounded, size: 17, color: Colors.white),
-                    SizedBox(width: 6),
-                    Text(
-                      '随便听一下',
-                      style: TextStyle(
-                        fontSize: 16.5,
-                        fontWeight: FontWeight.w800,
-                        color: Colors.white,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 5),
-                Text(
-                  '从你的收藏、常听和最近添加里智能混选',
-                  style: TextStyle(
-                    fontSize: 11.5,
-                    color: Colors.white.withValues(alpha: 0.88),
-                    height: 1.45,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(width: 10),
-          Material(
-            color: Colors.white.withValues(alpha: 0.22),
-            shape: const CircleBorder(),
-            child: InkWell(
-              customBorder: const CircleBorder(),
-              onTap: onPlay,
-              child: const SizedBox(
-                width: 46,
-                height: 46,
-                child: Icon(Icons.play_arrow_rounded, color: Colors.white, size: 28),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+/// 点「猜你想听」：让 AppState 去组歌起播，失败就如实报一句。
+///
+/// 成功时什么都不弹——歌已经开始放了自己就是最强的反馈，再叠一条
+/// 「已为你找到 30 首歌」只会盖在迷你播放条上。
+///
+/// ⚠️ `await` 之后必须判 `context.mounted`：拉推荐要两三秒，
+/// 这期间用户完全可能已经切走 tab 甚至退掉了这页。
+Future<void> _guessForYou(BuildContext context, AppState st) async {
+  final err = await st.guessForYou();
+  if (err == null || !context.mounted) return;
+  ScaffoldMessenger.of(context)
+    ..hideCurrentSnackBar()
+    ..showSnackBar(SnackBar(content: Text(err)));
 }

@@ -222,6 +222,8 @@ class FootActions extends StatelessWidget {
             active: st.sleepTimer != null,
             onTap: () => showTimerSheet(context, st),
           ),
+          // 下载（未下载 → 百分比 → 已下载，三态都在这一个位置上）
+          _DownloadFootBtn(st: st, song: st.current!),
           // 音效按钮的 active 态（EQ 非平直 / 响度非 0）由 FX 服务驱动：
           // 服务是 ChangeNotifier，面板里改参数后按钮即时点亮/熄灭。
           ListenableBuilder(
@@ -248,7 +250,7 @@ class FootActions extends StatelessWidget {
 class _FootBtn extends StatelessWidget {
   final IconData icon;
   final String label;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
   final bool active;
   final bool accent;
 
@@ -294,4 +296,88 @@ class _FootBtn extends StatelessWidget {
       ),
     );
   }
+}
+
+/// 播放页的下载按钮：三态（未下载 / 百分比 / 已下载）。
+///
+/// 单独一个 StatelessWidget 而不是内联在 [FootActions] 里，是因为它要同时
+/// 处理「点一下开始」「点第二下取消」「已下载点了是移除」三条分支，加上
+/// 确认弹窗和 SnackBar——内联会让那一行 Row 难读到看不出结构。
+class _DownloadFootBtn extends StatelessWidget {
+  final AppState st;
+  final Song song;
+
+  const _DownloadFootBtn({required this.st, required this.song});
+
+  @override
+  Widget build(BuildContext context) {
+    final ui = st.downloadUi(song);
+    final downloaded = ui.done;
+
+    return _FootBtn(
+      icon: downloaded
+          ? Icons.download_done_rounded
+          : ui.running
+              ? Icons.download_rounded
+              : Icons.download_outlined,
+      label: ui.label,
+      // 已下载 = 绿色高亮；下载中同样高亮，让这一格在五个按钮里明显是「活的」
+      active: downloaded || ui.running,
+      onTap: ui.enabled
+          ? () {
+              if (downloaded) {
+                _removeDownload(context, st, song);
+              } else if (ui.running) {
+                _report(context, st.cancelDownload());
+              } else if (ui.label == '重试') {
+                _report(context, st.retryDownload(song));
+              } else {
+                _report(context, st.startDownload(song));
+              }
+            }
+          : null,
+    );
+  }
+}
+
+/// 移除已下载要二次确认：这一步会**真的删掉手机上的文件**。
+Future<void> _removeDownload(
+  BuildContext context,
+  AppState st,
+  Song song,
+) async {
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('删除已下载的文件？', style: TextStyle(fontSize: 16)),
+      content: Text(
+        '「${song.title}」的本地文件会被删掉，之后播放这首歌重新走在线音源。',
+        style: const TextStyle(fontSize: 13),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(ctx).pop(false),
+          child: const Text('取消'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(ctx).pop(true),
+          child: const Text('删除'),
+        ),
+      ],
+    ),
+  );
+  if (ok != true) return;
+  // 弹窗挂着的时候播放页可能被 pop 掉（用户下滑关闭），
+  // 回来时 context 可能已经不在树上。
+  if (!context.mounted) return;
+  await _report(context, st.removeDownload(song));
+}
+
+/// 把「一句原因」如实说给用户。null = 成功，什么都不弹。
+Future<void> _report(BuildContext context, Future<String?> op) async {
+  final msg = await op;
+  if (msg == null || !context.mounted) return;
+  ScaffoldMessenger.of(context)
+    ..hideCurrentSnackBar()
+    ..showSnackBar(SnackBar(content: Text(msg)));
 }

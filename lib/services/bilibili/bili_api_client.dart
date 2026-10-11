@@ -120,11 +120,14 @@ class BiliApiClient {
 
         final code = (map['code'] as num?)?.toInt() ?? -1;
 
-        // -412 / -352 是风控触发：作废匿名 Cookie 缓存，让下次重取
+        // -412 / -352 是风控触发：作废匿名 Cookie 缓存，让下次重取。
+        // ⚠️ 只能调 invalidateAnonymousCookie()，**不能**调 setUserSession()——
+        // 后者无参调用等于 logout()，会把用户的 SESSDATA 一起清掉：
+        // 一次普通限流就把用户静默踢回匿名、丢掉 192K 音质且无 UI 提示。
         var risk = false;
         if (code == -412 || code == -352) {
           risk = true;
-          session.setUserSession();
+          session.invalidateAnonymousCookie();
           DiagLog.instance.w(
             DiagCategory.net,
             '触发风控 $code：$endpoint',

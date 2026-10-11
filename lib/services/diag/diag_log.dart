@@ -336,7 +336,9 @@ class DiagLog {
       final raw = await f.readAsLines();
       final keep = raw.length ~/ 2;
       await f.writeAsString('${raw.skip(keep).join('\n')}\n', flush: true);
-    } catch (_) {}
+    } catch (_) {
+      // 截断失败：文件暂时超限，下次写入会重试（自愈），不打断本次写入
+    }
   }
 
   String? _filePath() {
@@ -351,7 +353,10 @@ class DiagLog {
 
   /// 字段脱敏 + 长度收敛。
   ///
-  /// 只做「防御性」收敛：丢空值、截断超长字符串。
+  /// 只做「防御性」收敛：丢空值、截断超长字符串、**把非 JSON 基本类型
+  /// 压成字符串**（否则 e.line 的 jsonEncode 会抛 FormatException，
+  /// 整条日志被 log() 的兜底 catch 无声吞掉——DateTime / StackTrace /
+  /// 任意业务对象都踩过这类坑）。
   /// **凭据类字段的过滤责任在调用方**——日志系统不知道哪个字符串是 Cookie。
   Map<String, Object?> _sanitize(Map<String, Object?> src) {
     final out = <String, Object?>{};
@@ -361,8 +366,10 @@ class DiagLog {
       if (v is String) {
         if (v.isEmpty) continue;
         out[e.key] = v.length > 400 ? '${v.substring(0, 400)}…' : v;
-      } else {
+      } else if (v is num || v is bool) {
         out[e.key] = v;
+      } else {
+        out[e.key] = v.toString();
       }
     }
     return out;
@@ -496,7 +503,11 @@ class DiagLog {
           await e.delete().catchError((_) => e);
         }
       }
-    } catch (_) {}
+    } catch (e) {
+      // 清理失败不能无声：用户点了「清空」、文件却还在，至少内存 ring
+      // 里要有痕迹（ring 不依赖磁盘，一定可用）。
+      log(DiagLevel.error, DiagCategory.ui, '清空日志文件失败：$e');
+    }
   }
 
   /// 删除超过 [retainDays] 天的文件。启动时调一次。

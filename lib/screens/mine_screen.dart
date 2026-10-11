@@ -1,13 +1,26 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
-import '../models/models.dart';
-import '../services/settings/settings_store.dart';
 import '../state/app_state.dart';
+import '../state/music_dirs.dart';
 import '../theme.dart';
 import '../widgets/common.dart';
 import 'bili_login_page.dart';
 import 'diag_log_page.dart';
+import 'local_screens.dart';
+import 'settings_sheets.dart';
+import 'song_list_page.dart';
+
+/// App 实际版本号 —— 「我的」页底部展示用，必须与 pubspec.yaml 的
+/// `version` 一致（不带 `+build` 后缀）。
+///
+/// 2026-10-11 修：底部原来写死「Audora 2.0」，那是原型设计稿的年代号，
+/// 和真实发版号对不上；由常量统一出处，同步校验放在
+/// test/mine_footer_test.dart——改版号忘了改这里会直接测试失败。
+///
+/// 为什么不用 package_info_plus 动态读：为一行展示文案引入平台插件，
+/// 全部 widget 测试都要跟着 mock，不值当；版本只随发版变。
+const String kAppVersion = '0.1.0';
 
 class MineScreen extends StatelessWidget {
   final AppState st;
@@ -17,7 +30,9 @@ class MineScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     final t = Theme.of(context);
     final dark = t.brightness == Brightness.dark;
-    final liked = st.library.where(st.isLiked).toList();
+    // 设置区从 7 行压到 5 行（2026-10-11 用户反馈「太多」）：
+    // 音质两项进一个弹窗，目录两项进一个子页面，功能一个没少。
+    final dirsSet = MusicDirKind.values.where(st.musicDirSet).length;
 
     return Container(
       color: dark ? Tokens.bgDark : Tokens.bg,
@@ -90,10 +105,8 @@ class MineScreen extends StatelessWidget {
               ),
               child: Row(
                 children: [
-                // 「最近听」取代原「歌曲」（曲库列表不再是用户入口，
-                // 曲库规模对用户没有意义，最近听过几首才是真的）
-                _Stat(value: '${st.recentlyPlayed.length}', label: '最近听'),
-                _divider(dark),
+                // 「最近听」统计随入口一起挪到首页卡片了（2026-10-11），
+                // 这里只留两项：收藏是资产、常听是习惯，都还在本页有出口。
                 _Stat(value: '${st.likedCount}', label: '收藏'),
                 _divider(dark),
                 _Stat(value: '${st.topPlayed.length}', label: '常听'),                ],
@@ -102,30 +115,44 @@ class MineScreen extends StatelessWidget {
           ),
 
           // 入口卡
+          //
+          // 两张并列：收藏是本机资产，本地是「手机自带 + app 下载」的入口
+          // （2026-10-11 第二期：原「最近听」入口已移到首页卡片，这里补上本地）。
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
             child: Row(
               children: [
                 Expanded(
-                  child: _EntryCard(
+                  child: EntryCard(
                     icon: Icons.favorite_rounded,
                     title: '收藏',
                     subtitle: '${st.likedCount} 首',
                     color: Tokens.brand,
-                    onTap: () => _openList(context, '收藏', liked),
+                    // 列表**现查数据库**而不是从曲库窗口里筛：曲库只装最近
+                    // 500 行，收藏可以在窗口外——那正是「计数 1 首、点进去
+                    // 暂无内容」的成因（2026-10-11 真机复现）。
+                    onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                      builder: (_) => SongListPage(
+                        title: '收藏',
+                        songs: const [],
+                        loader: st.likedSongsList,
+                        st: st,
+                        emptyText: '还没有收藏\n在播放页点 ♥ 就能收进来',
+                      ),
+                    )),
                   ),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
-                  // 原「曲库」入口 → 「最近听」。曲库列表已不再是产品入口，
-                  // 这里展示按最后收听时间倒序、已按歌去重的播放记录。
-                  child: _EntryCard(
-                    icon: Icons.history_rounded,
-                    title: '最近听',
-                    subtitle: '${st.recentlyPlayed.length} 首',
-                    color: const Color(0xFF0EA5A4),
-                    onTap: () =>
-                        _openList(context, '最近听', st.recentlyPlayed),
+                  child: EntryCard(
+                    icon: Icons.sd_storage_rounded,
+                    title: '本地',
+                    subtitle: '${st.localCount + st.downloadCount} 首',
+                    color: const Color(0xFF6C5CE7),
+                    // 进去是「本地 / 下载」两个并列功能，这里不猜用户要哪个
+                    onTap: () => Navigator.of(context).push(MaterialPageRoute(
+                      builder: (_) => LocalHubPage(st: st),
+                    )),
                   ),
                 ),
               ],
@@ -155,15 +182,28 @@ class MineScreen extends StatelessWidget {
               clipBehavior: Clip.antiAlias,
               child: Column(
                 children: [
-                  _SettingRow(
-                    icon: Icons.high_quality_rounded,
+                  SettingsRow(
+                    icon: Icons.tune_rounded,
                     title: '音质偏好',
-                    // ⚠️ 这里必须展示真实生效的值。写成常量 '192Kbps' 时
-                    // 用户改了设置看不出变化，等同于假开关。
-                    trailing: st.quality.label,
-                    onTap: () => _pickQuality(context, st),
+                    subtitle: '在线与下载各一条上限，互不影响',
+                    // ⚠️ 必须展示真实生效的值。写成常量 '192Kbps' 时用户改了
+                    // 设置看不出变化，等同于假开关。两项都放进来，省掉两行。
+                    trailing:
+                        '在线 ${st.onlineQuality.chip} · 下载 ${st.downloadQuality.chip}',
+                    onTap: () => showQualityPrefsSheet(context, st),
                   ),
-                  _SettingRow(
+                  SettingsRow(
+                    icon: Icons.folder_open_rounded,
+                    title: '歌曲目录',
+                    subtitle: '本地扫描范围与下载存放位置，分开选',
+                    trailing: '已选 $dirsSet/2',
+                    // 目录这两项要拉起系统选择器，用子页面而不是弹窗：
+                    // 弹窗会被选择器盖掉，返回时还可能被路由销毁。
+                    onTap: () => Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => MusicDirsPage(st: st)),
+                    ),
+                  ),
+                  SettingsRow(
                     icon: Icons.qr_code_2_rounded,
                     title: 'B站账号',
                     subtitle: _biliLine(st),
@@ -174,7 +214,7 @@ class MineScreen extends StatelessWidget {
                       ),
                     ),
                   ),
-                  _SettingRow(
+                  SettingsRow(
                     icon: Icons.article_outlined,
                     title: '诊断日志',
                     subtitle: '音源匹配过程、网络风控与崩溃记录',
@@ -188,7 +228,7 @@ class MineScreen extends StatelessWidget {
                   // 曲库规模与加载状态对用户没有可操作意义（库永远是
                   // 「点歌即播」的自动产物），导入入口已被音乐页目录点歌
                   // 取代——留着只会让人以为还有什么需要手动维护。
-                  _SettingRow(
+                  SettingsRow(
                     icon: Icons.history_rounded,
                     title: '清除播放记录',
                     subtitle: '清空最近播放与常听统计',
@@ -201,11 +241,14 @@ class MineScreen extends StatelessWidget {
           ),
 
           // 关于
+          //
+          // 版本号取实际发版号（kAppVersion，与 pubspec 同步校验）；
+          // 协议声明与仓库 LICENSE（GPL-3.0）保持一致。
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
             child: Center(
               child: Text(
-                'Audora 2.0 · 个人自用 · 基于 Flutter',
+                'Audora v$kAppVersion · 基于 Flutter 开发 · 开源协议 GPL-3.0',
                 style: TextStyle(
                   fontSize: 11,
                   color: t.colorScheme.onSurfaceVariant,
@@ -278,73 +321,11 @@ class MineScreen extends StatelessWidget {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
-  /// 音质偏好选择。
-  ///
-  /// 用底部弹层而不是普通对话框：选项带说明文字（流量代价），
-  /// 需要更多纵向空间，弹层也更符合移动端「选一个值」的习惯。
-  Future<void> _pickQuality(BuildContext context, AppState st) async {
-    final picked = await showModalBottomSheet<QualityPreference>(
-      context: context,
-      showDragHandle: true,
-      builder: (ctx) {
-        final t = Theme.of(ctx);
-        return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Padding(
-                padding: EdgeInsets.fromLTRB(20, 0, 20, 4),
-                child: Text('音质偏好',
-                    style: TextStyle(
-                        fontSize: 15, fontWeight: FontWeight.w800)),
-              ),
-              const Padding(
-                padding: EdgeInsets.fromLTRB(20, 0, 20, 8),
-                child: Text(
-                  '设为上限：该档位没有可用音源时会自动放宽，不会静默无声。'
-                  '正在播放时立即换档并保留进度。',
-                  style: TextStyle(fontSize: 11.5),
-                ),
-              ),
-              for (final q in QualityPreference.values)
-                ListTile(
-                  leading: Icon(
-                    st.quality == q
-                        ? Icons.radio_button_checked_rounded
-                        : Icons.radio_button_unchecked_rounded,
-                    size: 20,
-                    color: st.quality == q
-                        ? Tokens.brand
-                        : t.colorScheme.onSurfaceVariant,
-                  ),
-                  title: Text(q.label, style: const TextStyle(fontSize: 13.5)),
-                  subtitle: Text(q.desc,
-                      style: const TextStyle(fontSize: 11.5)),
-                  onTap: () => Navigator.of(ctx).pop(q),
-                ),
-              const SizedBox(height: 6),
-            ],
-          ),
-        );
-      },
-    );
-    if (picked == null) return;
-    await st.setQuality(picked);
-  }
-
   Widget _divider(bool dark) => Container(
         width: 1,
         height: 26,
         color: dark ? Tokens.lineDark : Tokens.line,
       );
-
-  void _openList(BuildContext context, String title, List<Song> songs) {
-    Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => _SongListPage(title: title, songs: songs, st: st),
-    ));
-  }
-
 }
 
 class _Stat extends StatelessWidget {
@@ -369,154 +350,6 @@ class _Stat extends StatelessWidget {
             style: TextStyle(fontSize: 11, color: t.colorScheme.onSurfaceVariant),
           ),
         ],
-      ),
-    );
-  }
-}
-
-class _EntryCard extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final String subtitle;
-  final Color color;
-  final VoidCallback onTap;
-
-  const _EntryCard({
-    required this.icon,
-    required this.title,
-    required this.subtitle,
-    required this.color,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final t = Theme.of(context);
-    final dark = t.brightness == Brightness.dark;
-
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(Tokens.rLg),
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
-        decoration: BoxDecoration(
-          color: dark ? Tokens.surfaceDark : Tokens.surface,
-          borderRadius: BorderRadius.circular(Tokens.rLg),
-          border: Border.all(color: dark ? Tokens.lineDark : Tokens.line),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Container(
-              width: 36,
-              height: 36,
-              decoration: BoxDecoration(
-                color: color.withValues(alpha: dark ? 0.2 : 0.12),
-                borderRadius: BorderRadius.circular(Tokens.rSm),
-              ),
-              child: Icon(icon, size: 19, color: color),
-            ),
-            const SizedBox(height: 11),
-            Text(
-              title,
-              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w800),
-            ),
-            const SizedBox(height: 2),
-            Text(
-              subtitle,
-              style: TextStyle(fontSize: 11, color: t.colorScheme.onSurfaceVariant),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _SettingRow extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final String? subtitle;
-  final String? trailing;
-  /// null 表示禁用（导入/匹配进行中），此时灰显且不可点
-  final VoidCallback? onTap;
-  final bool isLast;
-
-  const _SettingRow({
-    required this.icon,
-    required this.title,
-    this.subtitle,
-    this.trailing,
-    required this.onTap,
-    this.isLast = false,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final t = Theme.of(context);
-    final dark = t.brightness == Brightness.dark;
-    final enabled = onTap != null;
-
-    return InkWell(
-      onTap: onTap,
-      child: Opacity(
-        opacity: enabled ? 1.0 : 0.45,
-        child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-        decoration: BoxDecoration(
-          border: isLast
-              ? null
-              : Border(
-                  bottom: BorderSide(color: dark ? Tokens.lineDark : Tokens.line),
-                ),
-        ),
-        child: Row(
-          children: [
-            Icon(icon, size: 19, color: t.colorScheme.onSurfaceVariant),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    title,
-                    style: const TextStyle(
-                        fontSize: 13.5, fontWeight: FontWeight.w600),
-                  ),
-                  // 副标题用来把「这个开关会带来什么代价」讲清楚，
-                  // 否则用户只看到「自动匹配」不知道会打接口
-                  if (subtitle != null) ...[
-                    const SizedBox(height: 2),
-                    Text(
-                      subtitle!,
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: t.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-            if (trailing != null)
-              Text(
-                trailing!,
-                style: TextStyle(
-                  fontSize: 11.5,
-                  fontWeight: FontWeight.w500,
-                  color: t.colorScheme.onSurfaceVariant,
-                ),
-              ),
-            const SizedBox(width: 4),
-            Icon(
-              Icons.chevron_right_rounded,
-              size: 18,
-              color: t.colorScheme.onSurfaceVariant,
-            ),
-          ],
-        ),
-        ),
       ),
     );
   }
@@ -577,71 +410,3 @@ class _BiliAvatar extends StatelessWidget {
     );
   }
 }
-
-/// 通用歌曲列表页（收藏 / 最近听共用）
-class _SongListPage extends StatelessWidget {
-  final String title;
-  final List<Song> songs;
-  final AppState st;
-
-  const _SongListPage({
-    required this.title,
-    required this.songs,
-    required this.st,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final dark = Theme.of(context).brightness == Brightness.dark;
-    return Scaffold(
-      backgroundColor: dark ? Tokens.bgDark : Tokens.bg,
-      appBar: AppBar(
-        title: Text(title, style: const TextStyle(fontWeight: FontWeight.w800)),
-        backgroundColor: dark ? Tokens.bgDark : Tokens.bg,
-        elevation: 0,
-      ),
-      body: SwipeBack(
-        onBack: () => Navigator.of(context).maybePop(),
-        child: songs.isEmpty
-            ? Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    Icons.inbox_rounded,
-                    size: 48,
-                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    '暂无内容',
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                ],
-              ),
-            )
-          : ListView.builder(
-              physics: const BouncingScrollPhysics(),
-              padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
-              itemCount: songs.length,
-              itemBuilder: (c, i) {
-                final s = songs[i];
-                return SongRow(
-                  song: s,
-                  leading: CoverArt(seed: s.coverSeed, size: 46, radius: Tokens.rSm),
-                  subtitle: '${s.artist} · ${s.album}',
-                  showDuration: false,
-                  trailing: s.sourceStatus != SourceStatus.ok
-                      ? SourceBadge(status: s.sourceStatus, compact: true)
-                      : null,
-                  onTap: () => st.playSong(s, source: songs),
-                );
-              },
-            ),
-      ),
-    );
-  }
-}
-

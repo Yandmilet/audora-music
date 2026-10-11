@@ -80,6 +80,10 @@ class ResolveResult {
   /// true 表示发生了「自动重新匹配」（原音源失效，已换到新的）
   final bool rematched;
 
+  /// 流的容器格式（下载时决定文件扩展名与 SAF 创建文档用的 MIME）。
+  /// 播放路径用不到它，所以默认给 B站 DASH 音频最常见的 'audio/mp4'。
+  final String mimeType;
+
   /// 失败原因（url 为 null 时非空）
   final String? error;
 
@@ -92,6 +96,7 @@ class ResolveResult {
     this.expireAt = 0,
     this.fromCache = false,
     this.rematched = false,
+    this.mimeType = 'audio/mp4',
     this.error,
   });
 
@@ -188,6 +193,23 @@ class SourceResolver {
 
     final sourceKey = src.sourceKey.isNotEmpty ? src.sourceKey : src.bvid;
     final sourceSubKey = src.sourceSubKey.isNotEmpty ? src.sourceSubKey : src.cid.toString();
+
+    // 本机文件（手机自带歌曲 / app 已下载）：sourceKey 装的就是可播 uri，
+    // 没有过期、没有缓存、也没有「换一首音源」可重匹配。直接短路，
+    // 不进 in-flight、不发 playurl、不写 URL 缓存——一次网络请求都不该有。
+    //
+    // ⚠️ 这里也不看 qualityCeiling：文件已经是哪档就是哪档，
+    // 「在线音质 / 下载音质」两条偏好对已落盘的文件都不成立。
+    if (src.sourceType == kLocalSourceType) {
+      return ResolveResult(
+        url: sourceKey,
+        qualityId: src.qualityId,
+        sourceKey: sourceKey,
+        sourceSubKey: sourceSubKey,
+        fromCache: true,
+      );
+    }
+
     final key = '$sourceKey/$sourceSubKey';
     final existing = _inflight[key];
     if (existing != null) return existing;
@@ -412,6 +434,80 @@ class SourceResolver {
   /// ⚠️ 递归只允许一层（`allowRematched: false`）。若新匹配出来的音源仍然
   /// 拉不到流，直接返回失败给用户，不再往下换——否则遇到「整个匹配器坏了」
   /// 的情况会在多首歌之间连环重匹配，把限流配额瞬间打光。
+  /// 为**下载**单独解析一条流。
+  ///
+  /// ## 为什么不复用 resolve()
+  /// 三处不对：
+  ///   1. `resolve()` 优先命中 URL 缓存。缓存里那条是按**在线音质**偏好挑的，
+  ///      直接拿来下载会把「下载音质」这个设置变成摆设。
+  ///   2. `resolve()` 会把拉到的 URL 回写进 `bilibili_video` 行。下载用的
+  ///      档位与在线用的档位不同时，回写会污染在线缓存（下次播放拿到
+  ///      一个没记过的档位）。
+  ///   3. 下载要的是「按 [ceiling] 上限给我一条能整文件拷走的流」，
+  ///      失败原因也应该直说，而不是触发自动重匹配换一首歌去下。
+  ///      （重匹配后下到的会是**另一场演出**，那不是你点的那首歌。）
+  ///
+  /// 所以这里强制重拉、不读不写缓存、`allowRematched` 语义上恒关。
+  Future<ResolveResult> resolveForDownload(
+    Song song, {
+    required int ceiling,
+  }) async {
+    final src = song.source;
+    if (src == null) {
+      return const ResolveResult(
+        sourceKey: '',
+        sourceSubKey: '',
+        error: '这首歌还没有可用音源，先播一次让它匹配上',
+      );
+    }
+    if (src.sourceType == kLocalSourceType) {
+      return const ResolveResult(
+        sourceKey: '',
+        sourceSubKey: '',
+        error: '这首歌已经在本地了',
+      );
+    }
+    final sourceKey = src.sourceKey.isNotEmpty ? src.sourceKey : src.bvid;
+    final sourceSubKey =
+        src.sourceSubKey.isNotEmpty ? src.sourceSubKey : src.cid.toString();
+    if (sourceKey.isEmpty) {
+      return const ResolveResult(
+        sourceKey: '',
+        sourceSubKey: '',
+        error: '音源标识为空，无法下载',
+      );
+    }
+
+    try {
+      final stream =
+          await api(sourceKey, sourceSubKey, qualityCeiling: ceiling);
+      if (stream == null) {
+        return ResolveResult(
+          sourceKey: sourceKey,
+          sourceSubKey: sourceSubKey,
+          error: '这个音源没有可下载的音频流',
+        );
+      }
+      final expireAt =
+          DateTime.now().add(_urlTtl).millisecondsSinceEpoch ~/ 1000;
+      return ResolveResult(
+        url: stream.url,
+        qualityId: stream.qualityId,
+        bandwidth: stream.bandwidth,
+        sourceKey: sourceKey,
+        sourceSubKey: sourceSubKey,
+        expireAt: expireAt,
+        mimeType: stream.mimeType,
+      );
+    } on Object catch (e) {
+      return ResolveResult(
+        sourceKey: sourceKey,
+        sourceSubKey: sourceSubKey,
+        error: '解析下载地址失败：$e',
+      );
+    }
+  }
+
   /// 缓存的 URL 是否仍符合当前音质上限偏好。
   ///
   /// - 没设上限（0）→ 一律算命中，缓存什么都不用管

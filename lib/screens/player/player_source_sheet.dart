@@ -126,8 +126,9 @@ void showSourceSheet(BuildContext context, AppState st, Song song) {
                           highlight: true,
                         ),
                         // 把「上限偏好」一并摊开：用户改了设置能立刻看到它
-                        // 生效在哪一档，而不是只能靠耳朵猜。
-                        _srcRow(t, '音质上限', st.quality.label),
+                        // 生效在哪一档，而不是只能靠耳朵猜。这里只管在线
+                        // 拉流的上限；下载音质是另一条独立偏好。
+                        _srcRow(t, '在线音质上限', st.onlineQuality.label),
                         _srcRow(
                           t,
                           '匹配分',

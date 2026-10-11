@@ -82,8 +82,8 @@ INSERT INTO ${Tables.song}
   (qq_song_mid, meta_source_type, meta_source_id,
    title, artists, album, album_mid, lyricist, composer,
    arranger, genre, release_date, duration_ms, cover_seed,
-   lyric_offset_ms, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   lyric_offset_ms, lyric_slope, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(qq_song_mid) DO UPDATE SET
   meta_source_type = excluded.meta_source_type,
   meta_source_id   = excluded.meta_source_id,
@@ -114,9 +114,10 @@ ON CONFLICT(qq_song_mid) DO UPDATE SET
           r.releaseDate,
           r.durationMs,
           r.coverSeed,
-          // lyric_offset_ms 仅在首次插入时写入；冲突时保留库中原值，
-          // 避免批量导入把用户手动校准的偏移静默覆盖
+          // lyric_offset_ms / lyric_slope 仅在首次插入时写入；冲突时保留
+          // 库中原值，避免批量导入把用户手动校准静默覆盖
           r.lyricOffsetMs,
+          r.lyricSlope,
           r.createdAt,
           r.updatedAt,
         ]);
@@ -261,15 +262,20 @@ Future<List<SongRow>> getAllExcluding(
     await db.delete(Tables.song, where: 'id = ?', whereArgs: [id]);
   }
 
-  /// 定向更新歌词校准偏移（毫秒）。
+  /// 定向更新歌词校准（平移毫秒 + 可选斜率）。
   ///
-  /// 只改 lyric_offset_ms 一列，不触发整行 upsert（避免覆盖其他字段）。
-  /// 由 AppState.adjustLyricOffset / resetLyricOffset 调用。
-  Future<void> updateLyricOffset(int songId, int offsetMs) async {
+  /// 只改 lyric_offset_ms / lyric_slope 两列，不触发整行 upsert
+  /// （避免覆盖其他字段）。由 AppState 的校准操作调用。
+  Future<void> updateLyricCalibration(
+    int songId, {
+    int? offsetMs,
+    double? slope,
+  }) async {
     await db.update(
       Tables.song,
       {
-        'lyric_offset_ms': offsetMs,
+        if (offsetMs != null) 'lyric_offset_ms': offsetMs,
+        if (slope != null) 'lyric_slope': slope,
         'updated_at': DateTime.now().millisecondsSinceEpoch ~/ 1000,
       },
       where: 'id = ?',

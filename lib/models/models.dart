@@ -15,6 +15,14 @@ const List<(String, String, String)> kRegions = [
   ('us', '欧美', '欧美'),
 ];
 
+/// 本机音频文件的音源类型标识。
+///
+/// `AudioSource.sourceType` 本来是给「B站 / YouTube / 网易」这类**远端**源
+/// 预留的通用字段；这里复用同一个值域，让「一个文件」也能走既有的
+/// Song → AudioSource → 播放器 链路，而不必为本地文件另开一套队列与通知栏。
+/// 解析层见到这个类型就直接把 sourceKey（uri）当可播地址，不发网络请求。
+const String kLocalSourceType = 'local';
+
 /// 音源匹配状态
 enum SourceStatus {
   /// 已自动匹配，置信度达标
@@ -99,6 +107,33 @@ class AudioSource {
   })  : sourceType = sourceType ?? 'bilibili',
         sourceKey = sourceKey ?? bvid,
         sourceSubKey = sourceSubKey ?? cid.toString();
+
+  /// 本机音频文件（手机自带 / app 下载）。
+  ///
+  /// 走的是同一套「Song 带一个 AudioSource」的模型，好处是播放链路、
+  /// 通知栏、队列、上一首下一首全都不用分叉；区别只在 [sourceType]
+  /// 是 'local'、而 [sourceKey] 装的是 content / SAF 文档 uri。
+  /// 解析层看到 'local' 就直接把 uri 当可播地址，不发任何网络请求。
+  ///
+  /// [bvid] 传空串：它在这个来源下没有意义，只是为了复用既有构造函数。
+  AudioSource.localFile({
+    required String uri,
+    String qualityLabel = '本地文件',
+    int qualityId = 0,
+    String uploader = '本机',
+  }) : this(
+          bvid: '',
+          cid: 0,
+          sourceType: kLocalSourceType,
+          sourceKey: uri,
+          sourceSubKey: '',
+          qualityLabel: qualityLabel,
+          qualityId: qualityId,
+          matchScore: 1,
+          auto: true,
+          durationDelta: 0,
+          uploader: uploader,
+        );
 
   AudioSource copyWith({
     String? sourceType,

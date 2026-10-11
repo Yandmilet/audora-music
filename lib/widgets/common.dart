@@ -902,3 +902,87 @@ class SongRow extends StatelessWidget {
     );
   }
 }
+
+/// 小入口卡：图标块 + 标题 + 一行副标题，点进去是一个列表页。
+///
+/// 首页（猜你想听 / 最近听过）与「我的」页（收藏 /（第二期）本地）用同
+/// 一种形状。原先它是 mine_screen 的私有 `_EntryCard`，首页要用就必然
+/// 复制一份——两处内边距迟早分叉，所以提到公共层。
+///
+/// [busy] 是「点了但事情还在跑」的状态：图标位换成转圈、点击吞掉。
+/// 用于「猜你想听」这种要发几个远端请求的入口，不给反馈就会被连点三次。
+class EntryCard extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final Color color;
+  final VoidCallback? onTap;
+  final bool busy;
+
+  const EntryCard({
+    super.key,
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.color,
+    this.onTap,
+    this.busy = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final t = Theme.of(context);
+    final dark = t.brightness == Brightness.dark;
+
+    return InkWell(
+      // busy 时不给 onTap：InkWell 传 null 就不响应点击，也不会出现水波纹
+      onTap: busy ? null : onTap,
+      borderRadius: BorderRadius.circular(Tokens.rLg),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+        decoration: BoxDecoration(
+          color: dark ? Tokens.surfaceDark : Tokens.surface,
+          borderRadius: BorderRadius.circular(Tokens.rLg),
+          border: Border.all(color: dark ? Tokens.lineDark : Tokens.line),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 36,
+              height: 36,
+              decoration: BoxDecoration(
+                color: color.withValues(alpha: dark ? 0.2 : 0.12),
+                borderRadius: BorderRadius.circular(Tokens.rSm),
+              ),
+              child: busy
+                  ? Padding(
+                      padding: const EdgeInsets.all(9),
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.4,
+                        color: color,
+                      ),
+                    )
+                  : Icon(icon, size: 19, color: color),
+            ),
+            const SizedBox(height: 11),
+            Text(
+              title,
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              subtitle,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 11,
+                color: t.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
