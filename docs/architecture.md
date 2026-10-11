@@ -13,9 +13,9 @@ lib/
 │   ├── mock_data.dart         # 空态兜底（仅 repo==null 时装载）
 │   ├── db/                    # SQLite 层（分层迁移）
 │   │   ├── app_database.dart  # 单例 / PRAGMA foreign_keys / 迁移调度
-│   │   ├── schema.dart        # 六表 DDL + 迁移脚本
+│   │   ├── schema.dart        # 九表 DDL + 迁移脚本（当前 v12）
 │   │   ├── rows.dart          # Row ↔ 领域对象映射
-│   │   └── dao/               # SongDao / VideoDao / BindingDao / LikedDao / PlayStatsDao / VolumeDao
+│   │   └── dao/               # Song / Video / Binding / Liked / PlayStats / Volume / MatchSample / LocalAudio
 │   └── repository/
 │       └── library_repository.dart  # 曲库聚合入口（读写 + 装配 + 匹配调度）
 ├── services/
@@ -31,16 +31,21 @@ lib/
 │   │   ├── match_scorer.dart  # 六维加权打分 + 降级路径
 │   │   └── match_engine.dart  # 召回 → 硬过滤 → 精确校验 → 打分
 │   ├── playback/              # 播放（SourceResolver + AudioPlayerController）
-│   ├── lyric/                 # 歌词（LRC 解析 + 翻译）
+│   ├── lyric/                 # 歌词（LRC/TTML 解析 + 逐字字轴 + AMLL 逐字源 + 翻译）
 │   ├── fx/                    # 音效（预设 + 服务）
 │   ├── settings/              # 本机偏好（SettingsStore）
 │   ├── net/                   # 滑动窗口限流（RateLimiter）
 │   ├── diag/                  # 诊断日志
 │   └── netease/               # 网易云（预留）
-├── state/                     # ChangeNotifier（AppState / OnlineSearch / PlayStats / BiliSession）
+├── state/                     # ChangeNotifier（AppState + 叶子模块：OnlineSearch / PlayStats / BiliSession / GuessForYou / MusicDirs / LocalLibrary / Download）
 ├── widgets/
-│   └── common.dart            # CoverArt / SourceBadge / MiniPlayer / SectionHeader / EmptyState
-└── screens/                   # 页面（player_screen 拆为 player/ 子目录多组件；home 拆为 home/）
+│   └── common.dart            # CoverArt（渐变占位）/ CoverImage（网络图压在占位上）/ SongCover / SourceBadge / MiniPlayer / EntryCard / SongRow / SwipeBack
+└── screens/                   # 页面（player_screen 拆为 player/ 子目录多组件；home 拆为 home/；
+                               #   列表页 song_list_page 与 local_screens 为多页共用）
+
+plugins/
+└── audora_files/              # 仓库内 Android 插件：SAF 目录选择与持久化授权 / MediaStore 音频扫描 / 下载落盘与进度回推
+                               #   （宿主 Activity 必须是 audio_service 的那个，所以平台通道只能做成插件，见其文件头注释）
 ```
 
 ## 数据流
@@ -59,6 +64,16 @@ lib/
 导入（两条路径）
   ├─「我的 → 导入歌曲」→ QQMusicProvider.resolveBatch（严格三重校验）
   └─「搜索页 → 在线 QQ 音乐」→ LibraryRepository.importOnline
+
+本机文件的线上身份补全（真实封面 + 歌词的唯一入口）
+  进「本地 / 下载」列表（postFrame，不阻塞）→ LocalLibraryBox.syncMissingMeta
+     ├─ 先零成本回填：下载条目 → 曲库那首歌的真 mid 直接抄进 local_audio
+     └─ 剩下的分片走 metadata.resolveBatch（标题+歌手+时长，串行 400ms/首）
+          → 命中：写 song_mid / album_mid / resolved_at（此后离线可用）
+          → 查无此歌：只写 resolved_at，冷却 3 天
+          → 请求异常：什么都不标（断网不是「歌不存在」的证据），连续 3 首即收手
+  播放本机歌 → 没身份就先单补这一首 → 补到则 force 重取歌词
+  渲染：album_mid → QQSongMeta.coverUrlFor → CoverImage；为空/拉不到图 → CoverArt 渐变
 
 匹配：按需（默认）/ 批量预处理
   ├─ 按需：播放时发现没音源 → 只匹配这一首（≈20 秒）
