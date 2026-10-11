@@ -61,3 +61,19 @@ app.*.map.json
 
 # WorkBuddy workspace data (local agent memory)
 .workbuddy/
+
+# 真机取证残留：adb 截图、uiautomator dump、从手机拉回来的诊断日志。
+# 都是当场看完就没用的东西（生成脚本是 tool/ui_dump.py，它默认就往这里吐文件）。
+/shot_*.png
+/audora_ui.xml
+/ui_*.txt
+/ui_dump.txt
+/mine_check_*.txt
+/diag_*.jsonl
+/_diag/
+
+# 改全局 gradle.properties 前留的还原点（配置缓存那条坑见 docs/toolchain-lock.md）
+global-gradle.properties.bak-*
+
+# 已从版本控制移除、只留在本机的工作流与 issue 模板（见 82ac2cb）
+/.github/
