@@ -1,6 +1,6 @@
 # Audora
 
-个人自用音乐播放器 —— Flutter + Android。
+音乐播放器 —— Flutter + Android。
 
 元数据来自 QQ音乐，音源来自 B站视频，通过四阶段流水线自动匹配。
 
@@ -79,8 +79,3 @@ audora-music/
 | [docs/build.md](docs/build.md) | 工具链、编译步骤、路径要求 |
 | [docs/testing.md](docs/testing.md) | 测试覆盖矩阵、真机冒烟 |
 | [TECH_DEBT.md](TECH_DEBT.md) | 故意保留的 B站专属代码位置 |
-
-## 合规
-
-- 本项目**仅个人自用**，不公开发布
-- B站音源遵守平台服务条款，仅本地缓存、不二次分发
