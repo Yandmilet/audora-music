@@ -5,19 +5,35 @@ plugins {
 }
 
 // ── Release 签名凭据读取 ──────────────────────────────────────────────
-// key.properties 与 audora-release.jks 均在 android/app/ 下，且已加入
+// key.properties 与 audora_music.jks 均在 android/app/ 下，且已加入
 // .gitignore（绝对禁止入库，内含明文口令与私钥）。
-// 缺失时静默回退到 debug signingConfig，保证新 clone 仓库也能正常 build。
+// 缺失即硬失败：静默回退 debug 签名的 release APK 与已装应用签名不一致、
+// 装不上去，还会让人误以为签名链路正常——宁可构建报错指路，也不要一个
+// 「看似成功」的假 release。
 import java.io.FileInputStream
 import java.util.Properties
 
 val keystorePropertiesFile = rootProject.file("app/key.properties")
-val keystoreProperties = Properties()
-val hasReleaseSigning = keystorePropertiesFile.exists() && runCatching {
-    keystoreProperties.load(FileInputStream(keystorePropertiesFile))
-    val store = keystoreProperties.getProperty("storeFile")
-    store != null && file(store).exists()
-}.getOrDefault(false)
+if (!keystorePropertiesFile.exists()) {
+    throw GradleException(
+        "缺少 android/app/key.properties（release 签名凭据：storeFile/storePassword/keyAlias/keyPassword）。" +
+        "该文件被 .gitignore 排除，新 clone 需从备份恢复；密钥库丢失则用 keytool -genkeypair 重建" +
+        "（重建后设备上已装的应用必须卸载重装，本地数据库会被清空）。"
+    )
+}
+val keystoreProperties = Properties().apply {
+    load(FileInputStream(keystorePropertiesFile))
+}
+val keystoreFile = file(
+    keystoreProperties.getProperty("storeFile")
+        ?: throw GradleException("key.properties 缺少 storeFile 字段")
+)
+if (!keystoreFile.exists()) {
+    throw GradleException(
+        "密钥库文件不存在: ${keystoreFile.absolutePath}（key.properties 的 storeFile 指向它）。" +
+        "请从备份恢复该 .jks，或用 keytool -genkeypair 重建并同步更新 key.properties。"
+    )
+}
 
 android {
     namespace = "com.fly1pu.audoramusic"
@@ -80,16 +96,14 @@ android {
         }
     }
 
-    // Release 签名配置：有 key.properties + 有效 .jks 时启用，否则回退 debug
-    // （保证新 clone 仓库也能正常构建 release APK，只是签名为 debug）。
+    // Release 签名配置：key.properties + 密钥库在文件头已硬校验，缺失直接
+    // 构建失败，不存在「回退 debug 签名」的假 release。
     signingConfigs {
         create("release") {
-            if (hasReleaseSigning) {
-                storeFile = file(keystoreProperties.getProperty("storeFile"))
-                storePassword = keystoreProperties.getProperty("storePassword")
-                keyAlias = keystoreProperties.getProperty("keyAlias")
-                keyPassword = keystoreProperties.getProperty("keyPassword")
-            }
+            storeFile = keystoreFile
+            storePassword = keystoreProperties.getProperty("storePassword")
+            keyAlias = keystoreProperties.getProperty("keyAlias")
+            keyPassword = keystoreProperties.getProperty("keyPassword")
             enableV1Signing = true
             enableV2Signing = true
             enableV3Signing = true
@@ -98,11 +112,7 @@ android {
 
     buildTypes {
         release {
-            signingConfig = if (hasReleaseSigning) {
-                signingConfigs.getByName("release")
-            } else {
-                signingConfigs.getByName("debug")
-            }
+            signingConfig = signingConfigs.getByName("release")
         }
     }
 }
