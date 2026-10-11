@@ -5,10 +5,10 @@
 /// sqflite_common_ffi 内存库验证存取语义。
 library;
 
-import 'package:audora2/data/db/app_database.dart';
-import 'package:audora2/data/db/rows.dart';
-import 'package:audora2/models/models.dart';
-import 'package:audora2/services/fx/fx_preset.dart';
+import 'package:audora_music/data/db/app_database.dart';
+import 'package:audora_music/data/db/rows.dart';
+import 'package:audora_music/models/models.dart';
+import 'package:audora_music/services/fx/fx_preset.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 

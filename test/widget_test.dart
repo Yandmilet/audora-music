@@ -9,9 +9,9 @@
 // 真正的启动链路（开库 → 装配 → 加载曲库）由 db_test 覆盖数据库部分，
 // 端到端则靠真机验证。
 
-import 'package:audora2/main.dart';
-import 'package:audora2/screens/player_screen.dart';
-import 'package:audora2/state/app_state.dart';
+import 'package:audora_music/main.dart';
+import 'package:audora_music/screens/player_screen.dart';
+import 'package:audora_music/state/app_state.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 

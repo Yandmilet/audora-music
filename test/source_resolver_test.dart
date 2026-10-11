@@ -11,13 +11,13 @@
 /// 「URL 还差 100 秒过期」这种边界，验证刷新时机是否正确。
 library;
 
-import 'package:audora2/data/db/app_database.dart';
-import 'package:audora2/data/db/rows.dart';
-import 'package:audora2/models/models.dart';
-import 'package:audora2/services/bilibili/bili_dto.dart';
-import 'package:audora2/services/bilibili/bili_exception.dart';
-import 'package:audora2/services/playback/source_resolver.dart';
-import 'package:audora2/services/source/audio_source_provider.dart';
+import 'package:audora_music/data/db/app_database.dart';
+import 'package:audora_music/data/db/rows.dart';
+import 'package:audora_music/models/models.dart';
+import 'package:audora_music/services/bilibili/bili_dto.dart';
+import 'package:audora_music/services/bilibili/bili_exception.dart';
+import 'package:audora_music/services/playback/source_resolver.dart';
+import 'package:audora_music/services/source/audio_source_provider.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 

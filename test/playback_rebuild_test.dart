@@ -23,8 +23,8 @@
 /// 这个数字就是整棵树的重建次数（根部 AnimatedBuilder 是它的订阅方）。
 library;
 
-import 'package:audora2/main.dart';
-import 'package:audora2/state/app_state.dart';
+import 'package:audora_music/main.dart';
+import 'package:audora_music/state/app_state.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 

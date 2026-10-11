@@ -9,8 +9,8 @@
 /// 需要 `MaterialApp` + `Navigator` + `Overlay` 齐备才能渲染完整。
 library;
 
-import 'package:audora2/main.dart';
-import 'package:audora2/state/app_state.dart';
+import 'package:audora_music/main.dart';
+import 'package:audora_music/state/app_state.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 

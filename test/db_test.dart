@@ -4,12 +4,12 @@
 /// 这样每次 `flutter test` 都能验证表结构与 SQL 逻辑，成本近乎为零。
 library;
 
-import 'package:audora2/data/db/app_database.dart';
-import 'package:audora2/data/db/rows.dart';
-import 'package:audora2/models/models.dart';
-import 'package:audora2/services/bilibili/bili_dto.dart';
-import 'package:audora2/services/match/match_config.dart';
-import 'package:audora2/services/match/match_scorer.dart';
+import 'package:audora_music/data/db/app_database.dart';
+import 'package:audora_music/data/db/rows.dart';
+import 'package:audora_music/models/models.dart';
+import 'package:audora_music/services/bilibili/bili_dto.dart';
+import 'package:audora_music/services/match/match_config.dart';
+import 'package:audora_music/services/match/match_scorer.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 

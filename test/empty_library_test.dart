@@ -11,15 +11,15 @@
 /// 所以这里把「空就是空」显式钉死。
 library;
 
-import 'package:audora2/data/db/app_database.dart';
-import 'package:audora2/data/repository/library_repository.dart';
-import 'package:audora2/services/bilibili/bili_api.dart';
-import 'package:audora2/services/bilibili/bili_api_client.dart';
-import 'package:audora2/services/match/match_engine.dart';
-import 'package:audora2/services/metadata/qqmusic_metadata_adapter.dart';
-import 'package:audora2/services/qqmusic/qqmusic_provider.dart';
-import 'package:audora2/services/source/bili_audio_source_adapter.dart';
-import 'package:audora2/state/app_state.dart';
+import 'package:audora_music/data/db/app_database.dart';
+import 'package:audora_music/data/repository/library_repository.dart';
+import 'package:audora_music/services/bilibili/bili_api.dart';
+import 'package:audora_music/services/bilibili/bili_api_client.dart';
+import 'package:audora_music/services/match/match_engine.dart';
+import 'package:audora_music/services/metadata/qqmusic_metadata_adapter.dart';
+import 'package:audora_music/services/qqmusic/qqmusic_provider.dart';
+import 'package:audora_music/services/source/bili_audio_source_adapter.dart';
+import 'package:audora_music/state/app_state.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 

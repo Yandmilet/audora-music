@@ -22,14 +22,14 @@ library;
 
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:audora2/models/models.dart';
-import 'package:audora2/services/bilibili/bili_api.dart';
-import 'package:audora2/services/bilibili/bili_api_client.dart';
-import 'package:audora2/services/bilibili/bili_dto.dart';
-import 'package:audora2/services/match/match_config.dart';
-import 'package:audora2/services/match/match_engine.dart';
-import 'package:audora2/services/net/rate_limiter.dart';
-import 'package:audora2/services/source/bili_audio_source_adapter.dart';
+import 'package:audora_music/models/models.dart';
+import 'package:audora_music/services/bilibili/bili_api.dart';
+import 'package:audora_music/services/bilibili/bili_api_client.dart';
+import 'package:audora_music/services/bilibili/bili_dto.dart';
+import 'package:audora_music/services/match/match_config.dart';
+import 'package:audora_music/services/match/match_engine.dart';
+import 'package:audora_music/services/net/rate_limiter.dart';
+import 'package:audora_music/services/source/bili_audio_source_adapter.dart';
 
 /// 假的 B站 API：不发任何网络请求，只记账。
 ///

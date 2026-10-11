@@ -10,9 +10,9 @@ library;
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:audora2/screens/bili_login_page.dart';
-import 'package:audora2/services/bilibili/bili_login.dart';
-import 'package:audora2/state/app_state.dart';
+import 'package:audora_music/screens/bili_login_page.dart';
+import 'package:audora_music/services/bilibili/bili_login.dart';
+import 'package:audora_music/state/app_state.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';

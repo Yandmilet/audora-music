@@ -13,19 +13,19 @@
 /// ⚠️ 会产生真实网络请求，不要放进 CI。命名带 `live_` 前缀便于识别与排除。
 library;
 
-import 'package:audora2/data/db/app_database.dart';
-import 'package:audora2/data/repository/library_repository.dart';
-import 'package:audora2/services/bilibili/bili_api.dart';
-import 'package:audora2/services/bilibili/bili_api_client.dart';
-import 'package:audora2/services/match/match_config.dart';
-import 'package:audora2/services/match/match_engine.dart';
-import 'package:audora2/services/metadata/qqmusic_metadata_adapter.dart';
-import 'package:audora2/services/net/rate_limiter.dart';
-import 'package:audora2/services/lyric/lrc_parser.dart';
-import 'package:audora2/services/playback/source_resolver.dart';
-import 'package:audora2/services/source/bili_audio_source_adapter.dart';
-import 'package:audora2/services/qqmusic/qqmusic_dto.dart';
-import 'package:audora2/services/qqmusic/qqmusic_provider.dart';
+import 'package:audora_music/data/db/app_database.dart';
+import 'package:audora_music/data/repository/library_repository.dart';
+import 'package:audora_music/services/bilibili/bili_api.dart';
+import 'package:audora_music/services/bilibili/bili_api_client.dart';
+import 'package:audora_music/services/match/match_config.dart';
+import 'package:audora_music/services/match/match_engine.dart';
+import 'package:audora_music/services/metadata/qqmusic_metadata_adapter.dart';
+import 'package:audora_music/services/net/rate_limiter.dart';
+import 'package:audora_music/services/lyric/lrc_parser.dart';
+import 'package:audora_music/services/playback/source_resolver.dart';
+import 'package:audora_music/services/source/bili_audio_source_adapter.dart';
+import 'package:audora_music/services/qqmusic/qqmusic_dto.dart';
+import 'package:audora_music/services/qqmusic/qqmusic_provider.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 

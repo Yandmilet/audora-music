@@ -17,8 +17,8 @@
 /// 把它简化成单档，导致点「华语」看不到周杰伦。
 library;
 
-import 'package:audora2/screens/home_screen.dart';
-import 'package:audora2/services/qqmusic/qqmusic_catalog_dto.dart';
+import 'package:audora_music/screens/home_screen.dart';
+import 'package:audora_music/services/qqmusic/qqmusic_catalog_dto.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

@@ -10,9 +10,9 @@ library;
 
 import 'dart:io';
 
-import 'package:audora2/screens/diag_log_page.dart';
-import 'package:audora2/services/diag/diag_log.dart';
-import 'package:audora2/state/app_state.dart';
+import 'package:audora_music/screens/diag_log_page.dart';
+import 'package:audora_music/services/diag/diag_log.dart';
+import 'package:audora_music/state/app_state.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 

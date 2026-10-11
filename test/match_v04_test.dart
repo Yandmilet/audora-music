@@ -4,12 +4,12 @@
 /// 运行：`flutter test test/match_v04_test.dart`
 library;
 
-import 'package:audora2/models/models.dart';
-import 'package:audora2/services/bilibili/bili_dto.dart';
-import 'package:audora2/services/match/match_config.dart';
-import 'package:audora2/services/match/match_scorer.dart';
-import 'package:audora2/services/match/title_parser.dart';
-import 'package:audora2/services/match/version_detector.dart';
+import 'package:audora_music/models/models.dart';
+import 'package:audora_music/services/bilibili/bili_dto.dart';
+import 'package:audora_music/services/match/match_config.dart';
+import 'package:audora_music/services/match/match_scorer.dart';
+import 'package:audora_music/services/match/title_parser.dart';
+import 'package:audora_music/services/match/version_detector.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {

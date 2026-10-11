@@ -13,8 +13,8 @@
 /// ```
 library;
 
-import 'package:audora2/services/qqmusic/qqmusic_catalog_dto.dart';
-import 'package:audora2/services/qqmusic/qqmusic_provider.dart';
+import 'package:audora_music/services/qqmusic/qqmusic_catalog_dto.dart';
+import 'package:audora_music/services/qqmusic/qqmusic_provider.dart';
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';

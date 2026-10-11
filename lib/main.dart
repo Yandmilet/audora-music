@@ -28,7 +28,7 @@ import 'widgets/common.dart';
 import 'shell.dart';
 
 // 应用外壳与路由基建在 shell.dart 实现；这里整体转出，
-// 保证 test/ 里 `import 'package:audora2/main.dart'` 的用法不变。
+// 保证 test/ 里 `import 'package:audora_music/main.dart'` 的用法不变。
 export 'shell.dart';
 
 /// 临时开关：true 时启动进入接口自检页（真机验证用）。

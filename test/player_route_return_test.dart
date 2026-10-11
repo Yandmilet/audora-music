@@ -36,13 +36,13 @@
 /// widget test 环境下平台通道不存在——这与 `widget_test.dart` 的取舍一致。
 library;
 
-import 'package:audora2/main.dart';
-import 'package:audora2/screens/browse_screen.dart';
-import 'package:audora2/screens/home_screen.dart';
-import 'package:audora2/screens/player_screen.dart';
-import 'package:audora2/services/qqmusic/qqmusic_dto.dart';
-import 'package:audora2/state/app_state.dart';
-import 'package:audora2/widgets/common.dart';
+import 'package:audora_music/main.dart';
+import 'package:audora_music/screens/browse_screen.dart';
+import 'package:audora_music/screens/home_screen.dart';
+import 'package:audora_music/screens/player_screen.dart';
+import 'package:audora_music/services/qqmusic/qqmusic_dto.dart';
+import 'package:audora_music/state/app_state.dart';
+import 'package:audora_music/widgets/common.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 

@@ -1,11 +1,11 @@
-name: audora2
-description: Audora 2.0 —— 个人自用音乐播放器（元数据来自 QQ音乐，音源来自 B站）
+name: audora_music
+description: Audora v0.1.0 —— 个人自用音乐播放器（元数据来自 QQ音乐，音源来自 B站）
 publish_to: 'none'
-version: 2.0.0+1
+version: 0.1.0+1
 
 environment:
-  sdk: '>=3.5.0 <4.0.0'
-  flutter: '>=3.24.0'
+  sdk: '>=3.13.4 <4.0.0'
+  flutter: '>=3.47.5 <3.48.0'
 
 dependencies:
   flutter:

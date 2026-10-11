@@ -8,7 +8,7 @@
 ///   - 纯音乐占位文案
 library;
 
-import 'package:audora2/services/lyric/lrc_parser.dart';
+import 'package:audora_music/services/lyric/lrc_parser.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
