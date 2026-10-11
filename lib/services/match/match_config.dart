@@ -134,9 +134,6 @@ class MatchConfig {
   /// 池子越大，预筛能挑到的正确音源越不容易被漏掉。
   static const int maxCandidates = 60;
 
-  /// 第一层只请求 Q1/Q2；若已有足够强的候选，则跳过 Q3/Q4。
-  static const int minRecallCandidates = 12;
-
   /// 质量路查询后缀（设计文档 13.6 修正项 ①）
   static const String qualitySuffix = '无损';
 

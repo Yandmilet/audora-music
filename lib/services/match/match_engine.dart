@@ -18,6 +18,7 @@ import '../net/rate_limiter.dart';
 import '../source/audio_source_provider.dart';
 import 'match_config.dart';
 import 'match_scorer.dart';
+import 'recall_scorer.dart';
 import 'text_normalizer.dart';
 
 /// 匹配结果（设计文档 4.7 的 `MatchResult`）
@@ -89,6 +90,27 @@ class MatchEngine {
   /// （播放量、失效状态都是会变的）。
   final Map<String, _CachedDetail> _detailCache = {};
 
+  /// 详情请求的**在途表**（in-flight dedup）。
+  ///
+  /// ## 它防的是「跨歌并发」，不是「同一首歌内重复」
+  /// 单次 `match()` 内部，Stage 1 的 [_mergeAndTrim] 已经用
+  /// `merged.putIfAbsent(c.bvid, ...)` 按 bvid 去重了，所以**同一首歌的
+  /// 一次匹配里**，同一个 bvid 只会有一条候选进来——这一层不需要本表兜。
+  ///
+  /// 真正会并发打到同一个 bvid 的是**跨歌**场景，而它们共用同一个
+  /// MatchEngine 实例（批量匹配 / 点播重解析都走 repository 里那一个）：
+  ///   - 批量匹配循环里，相邻两首歌的候选池可能指向同一个视频
+  ///     （同 UP 主的「XX 全集」被多首歌搜到）
+  ///   - `SourceResolver.resolveAfterPlaybackError` 在重新匹配时
+  ///     命中批量匹配正在处理的同一个 bvid
+  /// 这两路一旦重叠，缓存尚未写入（请求还在途），就会各发一次，
+  /// 把 30 次/分钟的额度白烧一份。
+  ///
+  /// 这里先查在途表、命中就复用同一个 Future，保证同一 sourceKey 在途
+  /// 最多一个请求。请求结束（成功或失败）都在 finally 里清键，
+  /// 失败不写缓存、后续调用照常重新发起，与「只缓存成功结果」一致。
+  final Map<String, Future<VideoDetail?>> _detailInFlight = {};
+
   /// 缓存条目上限，超了按**插入顺序**淘汰最旧的一条（FIFO）。
   /// 用 FIFO 而非 LRU：这里每条的成本相同，实现简单且不会有链表开销。
   static const int _detailCacheCap = 500;
@@ -100,7 +122,10 @@ class MatchEngine {
   /// 单测之间必须调用，否则上一个用例缓存的详情会串到下一个用例，
   /// 表现为「请求计数对不上」（缓存的条目没发请求）。
   /// 「强制重新匹配」这类需要拿最新元数据的场景也用它。
-  void clearDetailCache() => _detailCache.clear();
+  void clearDetailCache() {
+    _detailCache.clear();
+    _detailInFlight.clear();
+  }
 
   /// 搜索结果缓存（v0.5 限流与缓存设计）。
   ///
@@ -175,16 +200,17 @@ class MatchEngine {
   /// 外层只负责「开始 / 结束」两条诊断日志与耗时统计，
   /// 流水线本体在 [_matchImpl] —— 分开是为了让日志逻辑不掺进四阶段代码里。
   ///
-  /// [trustedUploaderMids]：v0.7 新增，已被其他歌曲验证过的 UP 主 mid 集合。
-  /// 传入后会在 Stage 4 给这些 UP 主的候选额外加分（跨歌学习信号）。
+  /// [trustedUploaderProfile]：P1 Uploader Bayesian Profile。
+  /// 已被其他歌曲验证过的 UP 主 mid → 正确次数映射。
+  /// 传入后会在 Stage 4 给这些 UP 主的候选按验证次数加权加分。
   Future<MatchResult> match(
     Song song, {
     /// 已知失效的 bvid，直接排除（设计文档 8.3 的自动修复）
     Set<String> excludeBvids = const {},
     void Function(String stage, String msg)? onLog,
 
-    /// v0.7：已验证可信的 UP 主 mid 集合（跨歌学习）
-    Set<int> trustedUploaderMids = const {},
+    /// P1：已验证可信 UP 主 mid → 正确次数（跨歌学习）
+    Map<int, int> trustedUploaderProfile = const {},
 
     /// v0.7：已被激活过的 bvid 集合（灰区二次校验）
     /// REVIEW 区间的候选若命中此集合，直接抬升为 AUTO
@@ -199,8 +225,8 @@ class MatchEngine {
         'song': song.title,
         'artist': song.artist,
         'duration': song.duration,
-        if (trustedUploaderMids.isNotEmpty)
-          'trustedMids': trustedUploaderMids.length,
+        if (trustedUploaderProfile.isNotEmpty)
+          'trustedMids': trustedUploaderProfile.length,
       },
     );
 
@@ -210,7 +236,7 @@ class MatchEngine {
         song,
         excludeBvids: excludeBvids,
         onLog: onLog,
-        trustedUploaderMids: trustedUploaderMids,
+        trustedUploaderProfile: trustedUploaderProfile,
         trustedBvids: trustedBvids,
       );
     } catch (e) {
@@ -262,7 +288,7 @@ class MatchEngine {
     Song song, {
     Set<String> excludeBvids = const {},
     void Function(String stage, String msg)? onLog,
-    Set<int> trustedUploaderMids = const {},
+    Map<int, int> trustedUploaderProfile = const {},
     Set<String> trustedBvids = const {},
   }) async {
     final diag = <String>[];
@@ -297,7 +323,7 @@ class MatchEngine {
           diag: diag,
           onLog: onLog,
           forceReview: true,
-          trustedUploaderMids: trustedUploaderMids,
+          trustedUploaderProfile: trustedUploaderProfile,
         ),
         trustedBvids,
       );
@@ -312,7 +338,7 @@ class MatchEngine {
         song,
         diag: diag,
         onLog: onLog,
-        trustedUploaderMids: trustedUploaderMids,
+        trustedUploaderProfile: trustedUploaderProfile,
       ),
       trustedBvids,
     );
@@ -324,7 +350,7 @@ class MatchEngine {
   /// 说明这个音源是可用且被用户确认过的，直接抬升为 AUTO。
   ///
   /// 这是跨歌学习的第二通道：
-  ///   - trustedUploaderMids（同 UP 主）→ Stage 4 S3 加分
+  ///   - trustedUploaderProfile（同 UP 主，P1 Bayesian Profile）→ Stage 4 S3 加分
   ///   - trustedBvids（同音源）→ post-processing 直接抬升置信度
   MatchResult _liftTrustedBvids(MatchResult result, Set<String> trustedBvids) {
     if (trustedBvids.isEmpty || !result.hasCandidate) return result;
@@ -699,32 +725,36 @@ class MatchEngine {
     List<VideoCandidate> candidates,
     Song song, {
     void Function(String stage, String msg)? onLog,
-    Set<int> trustedUploaderMids = const {},
   }) {
     if (candidates.isEmpty) return const [];
 
-    // 每条只打一次分，避免 sort comparator 重复计算。
-    final scored = candidates
-        .map((c) => _PreselectedCandidate(
-              candidate: c,
-              coarseScore: MatchScorer.score(
-                c,
-                song,
-                trustedUploaderMids: trustedUploaderMids,
-              ).total,
-            ))
-        .toList()
-      ..sort((a, b) => b.coarseScore.compareTo(a.coarseScore));
+    // P0-1：改用 RecallScorer 做召回排序，只用搜索接口已有字段。
+    // RecallScorer 返回 0 = 歌名根本没命中，直接过滤掉（不值得进详情）。
+    final scored = <_PreselectedCandidate>[];
+    for (final c in candidates) {
+      final s = RecallScorer.score(c, song);
+      if (s > 0) {
+        scored.add(_PreselectedCandidate(candidate: c, coarseScore: s));
+      }
+    }
+    scored.sort((a, b) => b.coarseScore.compareTo(a.coarseScore));
+
+    if (scored.isEmpty) {
+      _stage(onLog, 'Stage3', '预筛：全部候选召回分 = 0，无有效候选');
+      return const [];
+    }
 
     final k = _dynamicEnrichTopK(scored);
     final selected = scored.take(k).toList();
 
+    final filteredOut = candidates.length - scored.length;
     _stage(
       onLog,
       'Stage3',
-      '预筛 ${candidates.length} → $k 条，省下 ${candidates.length - k} 次详情请求',
+      '预筛 ${candidates.length} → ${scored.length}（过滤 $filteredOut 条无歌名命中）→ $k 条详情请求',
       fields: {
         'before': candidates.length,
+        'filteredOut': filteredOut,
         'after': k,
         'saved': candidates.length - k,
       },
@@ -757,13 +787,12 @@ class MatchEngine {
     required List<String> diag,
     void Function(String stage, String msg)? onLog,
     bool forceReview = false,
-    Set<int> trustedUploaderMids = const {},
+    Map<int, int> trustedUploaderProfile = const {},
   }) async {
     final selected = _preselect(
       candidates,
       song,
       onLog: onLog,
-      trustedUploaderMids: trustedUploaderMids,
     );
     if (selected.isEmpty) {
       diag.add('Stage3：预筛无候选');
@@ -792,7 +821,7 @@ class MatchEngine {
 
       for (final v in enriched) {
         scored.add(MatchScorer.score(v, song,
-            trustedUploaderMids: trustedUploaderMids));
+            trustedUploaderProfile: trustedUploaderProfile));
       }
 
       if (scored.isNotEmpty) {
@@ -803,10 +832,25 @@ class MatchEngine {
             ? selected[nextIndex].coarseScore
             : -1.0;
 
+        // ⚠️ 下一名用**粗排上界**参与比较，而不是直接拿粗排分相减。
+        // best.total 是 MatchScorer 的六维加权总分（已扣 penalty /
+        // contradiction），nextCoarse 是 RecallScorer 的召回分（权重不同、
+        // 还额外加了分区与播放量微调）——两把不同的尺子，相减得到的
+        // 「领先幅度」没有量纲意义：粗排本来就系统性偏高，可能误判成
+        // 「没拉开差距」而白白继续请求，也可能因刻度差恰好够 0.10 而
+        // 错误地砍掉本来会翻盘的正确候选。
+        //
+        // 这里换成一个**保守上界**：RecallScorer 只由「标题歌手 + 时长」
+        // 两个粗信号构成，而 MatchScorer 的 S1(标题) + S2(歌手) + S4(时长)
+        // 只会比它更严（多 penalty / 矛盾降级）。因此一个粗排 0.85 的候选，
+        // 精排实际大概率拿不到 0.85，取 0.85×[earlyStopGap] 作为它精排
+        // 的乐观上界；best 只有超出这个上界 [earlyStopGap] 才算真的领先。
+        final nextUpper = nextCoarse < 0 ? -1.0 : nextCoarse * MatchConfig.earlyStopGap;
+
         if (!forceReview &&
             best.total >= MatchConfig.earlyAutoThreshold &&
-            (nextCoarse < 0 ||
-                best.total - nextCoarse >= MatchConfig.earlyStopGap)) {
+            (nextUpper < 0 ||
+                best.total - nextUpper >= MatchConfig.earlyStopGap)) {
           _stage(
             onLog,
             'Stage3',
@@ -814,6 +858,7 @@ class MatchEngine {
             fields: {
               'best': best.total,
               'nextCoarse': nextCoarse,
+              'nextUpper': nextUpper,
               'requested': requested,
               'planned': selected.length,
             },
@@ -860,6 +905,51 @@ class MatchEngine {
     final best = finalScored.first;
     diag.add('胜出：${best.toString()}');
 
+    // P0-2：Best-vs-Second Margin 信心校验。
+    // 两个候选总分太接近（margin < 0.06）时，即使 best 是 AUTO 也强制 REVIEW ——
+    // 算法自己都没信心分清楚谁对，就不该自动绑定。
+    // 只有一个候选时跳过（margin 不存在）；forceReview 时也跳过（已经是 REVIEW）。
+    var finalBest = best;
+    if (!forceReview && finalScored.length >= 2) {
+      final runnerUp = finalScored[1];
+      final margin = best.total - runnerUp.total;
+      if (margin < 0.03 && best.confidence == MatchConfidence.auto) {
+        finalBest = ScoredCandidate(
+          video: best.video,
+          total: best.total,
+          detail: best.detail,
+          confidence: MatchConfidence.review,
+        );
+        _stage(
+          onLog,
+          'Stage4',
+          'Margin=${margin.toStringAsFixed(3)} < 0.03，AUTO 降级 REVIEW（候选打平）',
+          fields: {
+            'best': best.total,
+            'runnerUp': runnerUp.total,
+            'margin': margin
+          },
+        );
+      } else if (margin < 0.06 && best.confidence == MatchConfidence.auto) {
+        finalBest = ScoredCandidate(
+          video: best.video,
+          total: best.total,
+          detail: best.detail,
+          confidence: MatchConfidence.review,
+        );
+        _stage(
+          onLog,
+          'Stage4',
+          'Margin=${margin.toStringAsFixed(3)} < 0.06，AUTO 降级 REVIEW（领先不够明显）',
+          fields: {
+            'best': best.total,
+            'runnerUp': runnerUp.total,
+            'margin': margin
+          },
+        );
+      }
+    }
+
     final runnerUps = finalScored
         .skip(1)
         .where((s) => s.confidence != MatchConfidence.rejected)
@@ -867,7 +957,7 @@ class MatchEngine {
         .toList();
 
     return MatchResult(
-      best: best,
+      best: finalBest,
       runnerUps: runnerUps,
       diagnostics: diag,
     );
@@ -939,6 +1029,8 @@ class MatchEngine {
   }
 
   /// 带缓存的详情查询。只缓存成功结果（null 代表视频失效，必须每次现查）。
+  ///
+  /// 同一 sourceKey 在途只会有一个请求（见 [_detailInFlight]）。
   Future<VideoDetail?> _detailOf(String sourceKey) async {
     final hit = _detailCache[sourceKey];
     if (hit != null && DateTime.now().difference(hit.at) < _detailTtl) {
@@ -947,6 +1039,22 @@ class MatchEngine {
     // 过期条目顺手清掉，避免它继续占着容量上限
     if (hit != null) _detailCache.remove(sourceKey);
 
+    // 已在途 → 等同一个 Future，不再重复发请求
+    final running = _detailInFlight[sourceKey];
+    if (running != null) return running;
+
+    final future = _fetchDetailOnce(sourceKey);
+    _detailInFlight[sourceKey] = future;
+    try {
+      return await future;
+    } finally {
+      // 成功 / 失败 / 抛异常都要清键，否则失败后会被永久毒化
+      _detailInFlight.remove(sourceKey);
+    }
+  }
+
+  /// 真正打网络取详情，并负责写缓存。调用方 [_detailOf] 已做在途去重。
+  Future<VideoDetail?> _fetchDetailOnce(String sourceKey) async {
     final sourceDetail = await sourceProvider.fetchSourceDetail(sourceKey);
     if (sourceDetail != null) {
       final detail = _toVideoDetail(sourceDetail);

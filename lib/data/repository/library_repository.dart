@@ -24,6 +24,7 @@ import '../../services/net/rate_limiter.dart' show mapWithConcurrency;
 import '../../services/netease/netease_provider.dart';
 import '../db/app_database.dart';
 import '../db/dao/binding_dao.dart';
+import '../db/dao/song_dao.dart' show ExcludeScope;
 import '../db/dao/video_dao.dart';
 import '../db/dao/play_stats_dao.dart';
 import '../db/schema.dart';
@@ -623,15 +624,15 @@ class LibraryRepository {
     // 排除已知失效的 bvid（设计文档 8.3 的自动修复）
     final failed = await db.bindings.getFailedBvids(songId);
 
-    // v0.7 跨歌学习：查询已验证的可信信号
-    final trustedMids = await db.bindings.getActiveUploaderMids();
+    // P1 Uploader Bayesian Profile：带计数的已验证 UP 主
+    final trustedUploaderProfile = await db.bindings.getActiveUploaderProfile();
     final trustedBvids = await db.bindings.getActiveBvids();
 
     final result = await engine.match(
       song,
       excludeBvids: failed,
       onLog: onLog,
-      trustedUploaderMids: trustedMids,
+      trustedUploaderProfile: trustedUploaderProfile,
       trustedBvids: trustedBvids,
     );
 
@@ -670,6 +671,21 @@ class LibraryRepository {
         );
       }
     });
+
+    // V0.9 Golden Dataset：写匹配快照（非事务、失败静默）
+    // 只记录 best + runnerUps——完整候选列表 MatchResult 不暴露，
+    // 但这已经足够离线评估（margin/confidence/decision 都在）
+    await db.matchSamples.insertMatchSample(
+      songId: songId,
+      song: song,
+      result: result,
+      allCandidates: all,
+    );
+
+    // V0.9 Golden Dataset 回填：匹配到正确 AUTO 候选 = 用户"隐式接受"
+    if (result.isBound) {
+      await db.matchSamples.markAccepted(songId, result.best!.video.bvid);
+    }
 
     return result;
   }
@@ -793,7 +809,7 @@ class LibraryRepository {
   /// [SongDao.getAllExcluding] 注释）。
   Future<List<SongWithSource>> unmatchedQueue({int limit = 100}) async {
     final rows = await db.songs.getAllExcluding(
-      'SELECT DISTINCT song_id FROM ${Tables.binding}',
+      ExcludeScope.anyBinding,
       limit: limit,
     );
     return rows
@@ -876,7 +892,7 @@ class LibraryRepository {
   /// 批量匹配会漏掉排不进前 200 的歌（且越攒越多）。
   Future<List<SongRow>> _unmatchedSongs({int limit = 50}) async {
     return db.songs.getAllExcluding(
-      'SELECT song_id FROM ${Tables.binding} WHERE is_active = 1',
+      ExcludeScope.activeBinding,
       limit: limit,
     );
   }
@@ -1019,6 +1035,10 @@ class LibraryRepository {
       matchType: MatchType.userSelected,
       note: note ?? '手动搜索指定',
     );
+    // Golden Dataset 反馈：手动搜索指定是对此前匹配快照的最终裁决——
+    // 覆盖 AUTO 绑定时的隐式接受（chosen ≠ best → 负样本）。
+    // 无快照时 DAO 静默无操作；失败也不影响绑定主流程。
+    await db.matchSamples.markUserChoice(songId, video.bvid);
   }
 }
 

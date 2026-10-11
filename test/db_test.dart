@@ -4,11 +4,16 @@
 /// 这样每次 `flutter test` 都能验证表结构与 SQL 逻辑，成本近乎为零。
 library;
 
+import 'dart:convert';
+
 import 'package:audora_music/data/db/app_database.dart';
+import 'package:audora_music/data/db/dao/song_dao.dart' show ExcludeScope;
 import 'package:audora_music/data/db/rows.dart';
+import 'package:audora_music/data/db/schema.dart';
 import 'package:audora_music/models/models.dart';
 import 'package:audora_music/services/bilibili/bili_dto.dart';
 import 'package:audora_music/services/match/match_config.dart';
+import 'package:audora_music/services/match/match_engine.dart';
 import 'package:audora_music/services/match/match_scorer.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -431,20 +436,22 @@ void main() {
           rows.map((r) => r.title).toSet();
       // unmatchedQueue 口径：有任何绑定记录就排除
       expect(
-        titles(await db.songs
-            .getAllExcluding('SELECT DISTINCT song_id FROM song_source_binding')),
+        titles(await db.songs.getAllExcluding(ExcludeScope.anyBinding)),
         {'C'},
       );
       // 批量匹配口径：只排除有激活音源的（REVIEW 也要重跑）
       expect(
-        titles(await db.songs.getAllExcluding(
-            'SELECT song_id FROM song_source_binding WHERE is_active = 1')),
+        titles(await db.songs.getAllExcluding(ExcludeScope.activeBinding)),
         {'B', 'C'},
       );
-      // 子查询为空 → 返回全部（NOT IN 空集语义）
+      // 一条绑定都没有 → 两种口径都返回全部（NOT IN 空集语义）
+      await db.db.delete('song_source_binding');
       expect(
-        titles(await db.songs
-            .getAllExcluding('SELECT song_id FROM song_source_binding WHERE 0')),
+        titles(await db.songs.getAllExcluding(ExcludeScope.anyBinding)),
+        {'A', 'B', 'C'},
+      );
+      expect(
+        titles(await db.songs.getAllExcluding(ExcludeScope.activeBinding)),
         {'A', 'B', 'C'},
       );
     });
@@ -483,7 +490,7 @@ void main() {
       }
 
       final got = await db.songs.getAllExcluding(
-        'SELECT song_id FROM song_source_binding WHERE is_active = 1',
+        ExcludeScope.activeBinding,
         limit: 3,
       );
       expect(got.length, 3, reason: '库里还有 10 首未激活的歌，不应因扫描窗口截断而拿不满');
