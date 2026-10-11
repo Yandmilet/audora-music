@@ -121,7 +121,11 @@ void main() {
       expect(() => st.next(), returnsNormally);
       expect(() => st.previous(), returnsNormally);
       expect(() => st.jumpTo(0), returnsNormally);
-      expect(() => st.shufflePlay(), returnsNormally);
+      // 「猜你想听」取代了旧的 shufflePlay。空库时它没有口味种子，会去
+      // 拉榜单；而这条链路的 qq provider 未注入（目录浏览不可用），
+      // 必须**如实回一句文案**而不是抛异常或装作播起来了。
+      await expectLater(st.guessForYou(), completes);
+      expect(st.queue, isEmpty, reason: '拉不到推荐就不该凭空多出播放队列');
       // togglePlay 是 async：必须 await，否则异常会在 await 之后才抛，
       // 而 returnsNormally 只覆盖同步段，等于没测。
       await expectLater(st.togglePlay(), completes);

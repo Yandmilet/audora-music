@@ -70,8 +70,18 @@ void main() {
     }
     final ring = log.ring;
     expect(ring.length, DiagLog.ringCap);
-    // 最新的在最后，最旧的已被挤掉
-    expect(ring.last.message, '第 ${DiagLog.ringCap + 49} 条');
+    // 最新的还在、最旧的已被挤掉。
+    //
+    // ⚠️ 这里刻意不写 `ring.last.message == '第 N 条'`：本套件的其它用例会
+    // 留下**异步**的日志写入（flush / 定时器里的 log），它们可能落在这个
+    // 同步测试之后、本文件下一个 setUp 之前的缝隙里，把 last 顶掉。
+    // 全量并发跑时实测会因此假失败。「上限生效 + 新的在 + 旧的被挤掉」
+    // 这三条才是这个测试要钉的东西。
+    expect(
+      ring.any((e) => e.message == '第 ${DiagLog.ringCap + 49} 条'),
+      isTrue,
+      reason: '最后写入的那条必须还在',
+    );
     expect(ring.any((e) => e.message == '第 0 条'), isFalse);
   });
 
@@ -85,6 +95,23 @@ void main() {
     expect(hit, isNotEmpty);
     expect(hit.single.fields['bvid'], 'BV1xx411c7mD');
     expect(hit.single.category, DiagCategory.match);
+  });
+
+  test('字段含不可 JSON 编码的对象时，条目仍应保留并可落盘', () async {
+    final log = DiagLog.instance;
+    log.i(DiagCategory.match, '带对象字段', {
+      'at': DateTime.now(), // 无 toJson：旧实现 jsonEncode 抛异常 → 整条被兜底 catch 吞掉
+      'err': Object(),
+    });
+
+    final hit = log.ring.where((e) => e.message == '带对象字段').toList();
+    expect(hit, hasLength(1), reason: '坏字段不该让整条日志无声消失');
+    expect(hit.single.fields['at'], isA<String>());
+    expect(hit.single.fields['err'], contains('Object'));
+
+    await log.flush();
+    final fromDisk = (await log.readAll()).where((e) => e.message == '带对象字段');
+    expect(fromDisk, isNotEmpty);
   });
 
   test('统计：请求数 / -412 / 匹配成功率 / 崩溃', () async {

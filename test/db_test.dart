@@ -58,6 +58,48 @@ void main() {
       expect(got.toSong().duration, 200);
     });
 
+    test('全新建表包含 lyric_slope 列且默认 1.0（v10）', () async {
+      final cols = await db.db.rawQuery('PRAGMA table_info(${Tables.song})');
+      final slopeCols =
+          cols.where((c) => c['name'] == 'lyric_slope').toList();
+      expect(slopeCols, hasLength(1), reason: 'kCreateSongTable 必须含新列');
+      // PRAGMA table_info 的 dflt_value 按 SQL 表达式文本返回
+      expect(slopeCols.first['dflt_value'], '1.0');
+
+      final id = await db.songs.upsert(row('斜率歌'));
+      final got = await db.songs.getById(id);
+      expect(got!.lyricSlope, 1.0);
+      expect(got.toSong().lyricSlope, 1.0);
+    });
+
+    test('updateLyricCalibration 写入平移与斜率，缺省列不被覆盖', () async {
+      final id = await db.songs.upsert(row('校准歌'));
+
+      await db.songs
+          .updateLyricCalibration(id, offsetMs: -15000, slope: 1.05);
+      var got = await db.songs.getById(id);
+      expect(got!.lyricOffsetMs, -15000);
+      expect(got.lyricSlope, closeTo(1.05, 1e-9));
+
+      // 只改 offset 时 slope 保持
+      await db.songs.updateLyricCalibration(id, offsetMs: 300);
+      got = await db.songs.getById(id);
+      expect(got!.lyricOffsetMs, 300);
+      expect(got.lyricSlope, closeTo(1.05, 1e-9));
+    });
+
+    test('批量 upsert 冲突时保留用户已校准的 offset / slope', () async {
+      final ids = await db.songs.upsertAll([row('批量校准')]);
+      await db.songs
+          .updateLyricCalibration(ids.single, offsetMs: 900, slope: 1.02);
+
+      // 同一首歌再次批量导入：校准数据不能被静默抹掉
+      await db.songs.upsertAll([row('批量校准')]);
+      final got = await db.songs.getById(ids.single);
+      expect(got!.lyricOffsetMs, 900);
+      expect(got.lyricSlope, closeTo(1.02, 1e-9));
+    });
+
     test('同 mid 重复插入走更新而非新增，且保留 created_at', () async {
       final id1 = await db.songs.upsert(row('秘密'));
       final before = await db.songs.getById(id1);
@@ -497,6 +539,140 @@ void main() {
       // 按 created_at DESC 取「最新的 3 首未激活」，即未绑定的前 10 首中最新 3 首
       final expected = ids.take(10).toList().reversed.take(3).toSet();
       expect(got.map((r) => r.id).toSet(), expected);
+    });
+  });
+
+  group('MatchSampleDao — Golden Dataset 数据闭环', () {
+    Song songOf(String title) => Song(
+          title: title,
+          artist: '测试歌手',
+          album: '专辑',
+          duration: 200,
+          releaseDate: DateTime(2020, 1, 1),
+          coverSeed: 1,
+        );
+
+    ScoredCandidate cand(String bvid, {double total = 0.9}) => ScoredCandidate(
+          video: VideoCandidate(
+            bvid: bvid,
+            title: '测试歌手 - 歌$bvid',
+            durationSec: 200,
+            pubdate: 1580000000,
+          ),
+          total: total,
+          detail: const ScoreDetail(
+            s1TitleArtist: 0.9,
+            s2Duration: 0.9,
+            s3Uploader: 0.5,
+            s4Publish: 0.5,
+            s5Category: 0.5,
+            s6Format: 0.5,
+          ),
+          confidence: MatchConfidence.auto,
+        );
+
+    Future<int> seed(String title) async {
+      final songId = await db.songs.upsert(row(title));
+      await db.matchSamples.insertMatchSample(
+        songId: songId,
+        song: songOf(title),
+        result: MatchResult(
+          best: cand('BVbest', total: 0.9),
+          runnerUps: [cand('BVother', total: 0.8)],
+        ),
+        allCandidates: [cand('BVbest', total: 0.9), cand('BVother', total: 0.8)],
+      );
+      return songId;
+    }
+
+    Future<List<Map<String, Object?>>> sampleRows(int songId) =>
+        db.matchSamples.db.query(
+          Tables.matchSample,
+          where: 'song_id = ?',
+          whereArgs: [songId],
+          orderBy: 'id',
+        );
+
+    test('快照落库，candidates_json / best_detail 是合法 JSON 且可往返', () async {
+      final songId = await seed('秘密');
+      final r = (await sampleRows(songId)).single;
+
+      expect(r['best_bvid'], 'BVbest');
+      expect(r['best_confidence'], 'auto');
+      expect(r['margin'], closeTo(0.1, 1e-9));
+
+      final cands = jsonDecode(r['candidates_json'] as String) as List;
+      expect(cands.length, 2);
+      expect(cands[0]['bvid'], 'BVbest');
+      expect((cands[0]['detail'] as Map)['s1'], 0.9);
+
+      final bestDetail = jsonDecode(r['best_detail'] as String) as Map;
+      expect(bestDetail['s2'], 0.9);
+    });
+
+    test('markUserChoice：选回 best → accept（覆盖隐式接受后仍一致）', () async {
+      final songId = await seed('A');
+      await db.matchSamples.markAccepted(songId, 'BVbest'); // AUTO 隐式接受
+      await db.matchSamples.markUserChoice(songId, 'BVbest');
+
+      final r = (await sampleRows(songId)).single;
+      expect(r['user_decision'], 'accept');
+      expect(r['decision_bvid'], 'BVbest');
+    });
+
+    test('markUserChoice：改选别的 → reject + decision_bvid 记用户选择', () async {
+      // 关键场景：AUTO 绑定时 markAccepted 已落 'accept'，用户事后改选
+      // 必须能覆盖那次隐式接受（负样本通道，不能被 WHERE IS NULL 挡掉）。
+      final songId = await seed('B');
+      await db.matchSamples.markAccepted(songId, 'BVbest');
+      await db.matchSamples.markUserChoice(songId, 'BVother');
+
+      final r = (await sampleRows(songId)).single;
+      expect(r['user_decision'], 'reject');
+      expect(r['decision_bvid'], 'BVother');
+    });
+
+    test('同一首歌多条快照：markUserChoice 只覆盖最新一条', () async {
+      final songId = await seed('C');
+      // 同 ms 内连插两条也可靠（ORDER BY created_at DESC, id DESC 的 id 兜底）
+      await db.matchSamples.insertMatchSample(
+        songId: songId,
+        song: songOf('C'),
+        result: MatchResult(
+          best: cand('BVnew', total: 0.7),
+          runnerUps: [cand('BVlow', total: 0.6)],
+        ),
+        allCandidates: [cand('BVnew', total: 0.7), cand('BVlow', total: 0.6)],
+      );
+      await db.matchSamples.markUserChoice(songId, 'BVlow');
+
+      final rows = await sampleRows(songId);
+      expect(rows.length, 2);
+      expect(rows.last['user_decision'], 'reject', reason: '最新一条被覆盖');
+      expect(rows.last['decision_bvid'], 'BVlow');
+      expect(rows.first['user_decision'], isNull, reason: '旧快照不动');
+    });
+
+    test('无快照时 markUserChoice / markAccepted 静默无操作', () async {
+      final songId = await db.songs.upsert(row('D'));
+      await db.matchSamples.markUserChoice(songId, 'BVx');
+      await db.matchSamples.markAccepted(songId, 'BVx');
+      expect(await db.matchSamples.db.query(Tables.matchSample), isEmpty);
+    });
+
+    test('summary：被推翻的 AUTO 不计入 auto_correct', () async {
+      final a = await seed('E');
+      await db.matchSamples.markAccepted(a, 'BVbest');
+      final b = await seed('F');
+      await db.matchSamples.markUserChoice(b, 'BVother'); // 负样本
+      await seed('G'); // 未决策
+
+      final s = await db.matchSamples.summary();
+      expect(s['total'], 3);
+      expect(s['auto_total'], 3);
+      expect(s['auto_correct'], 1);
+      expect(s['decisions_total'], 2);
+      expect(s['decisions_correct'], 1);
     });
   });
 }

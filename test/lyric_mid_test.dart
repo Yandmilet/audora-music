@@ -211,6 +211,74 @@ void main() {
       expect(stub.lyricCalls, 1);
       expect(stub.lastMid, 'realMid123');
     });
+
+    // ── v12：本机文件靠补到的身份也能有歌词 ────────────────────
+    //
+    // 以前 fetchLyric 第一行就是 `if (id == null) return null`，本机扫描出来
+    // 的文件在 song 表里没有行，于是「播本地歌永远看不到歌词」是写死的。
+
+    test('没有曲库行的本机歌，带 midFallback 就能取到歌词', () async {
+      final stub = _StubQQ();
+      final repo = LibraryRepository(
+        db: db,
+        engine: _NoopEngine(),
+        metadata: QQMusicMetadataAdapter(stub),
+      );
+      // id 为 null：本机扫描条目
+      final local = Song(
+        title: '本机歌',
+        artist: '某歌手',
+        duration: 200,
+        coverSeed: 7,
+        source: AudioSource.localFile(uri: 'content://media/external/1'),
+      );
+
+      expect(await repo.fetchLyric(local), isNull,
+          reason: '没补到身份时仍然不该打请求');
+      expect(stub.lyricCalls, 0);
+
+      final bundle = await repo.fetchLyric(local, midFallback: 'localResolvedMid');
+      expect(bundle?.lrc, '[00:01.00]hello');
+      expect(stub.lyricCalls, 1);
+      expect(stub.lastMid, 'localResolvedMid');
+    });
+
+    test('曲库行是 local: 派生键时，midFallback 顶上', () async {
+      final id = await db.songs.upsert(SongRow.fromSong(
+        _song('x', 'y', 1),
+        qqSongMid: SongRow.deriveMid('x', 'y'),
+        now: 1000,
+      ));
+      final stub = _StubQQ();
+      final repo = LibraryRepository(
+        db: db,
+        engine: _NoopEngine(),
+        metadata: QQMusicMetadataAdapter(stub),
+      );
+      final song = (await db.songs.getById(id))!.toSong();
+
+      final bundle = await repo.fetchLyric(song, midFallback: 'fallbackMid');
+      expect(bundle, isNotNull);
+      expect(stub.lastMid, 'fallbackMid');
+    });
+
+    test('行内已有真 mid 时不被 fallback 抢位（曲库行优先）', () async {
+      final id = await db.songs.upsert(SongRow.fromSong(
+        _song('x', 'y', 1),
+        qqSongMid: 'realMid123',
+        now: 1000,
+      ));
+      final stub = _StubQQ();
+      final repo = LibraryRepository(
+        db: db,
+        engine: _NoopEngine(),
+        metadata: QQMusicMetadataAdapter(stub),
+      );
+      final song = (await db.songs.getById(id))!.toSong();
+
+      await repo.fetchLyric(song, midFallback: 'shouldBeIgnored');
+      expect(stub.lastMid, 'realMid123');
+    });
   });
 }
 
