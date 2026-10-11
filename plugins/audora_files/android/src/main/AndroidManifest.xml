@@ -1,0 +1,33 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.fly1pu.audora_files">
+
+    <!--
+      本插件需要的权限随插件声明，由 manifest 合并进 host app：
+
+      READ_MEDIA_AUDIO —— Android 13+ 读取手机自带音乐（MediaStore 音频扫描）。
+      READ_EXTERNAL_STORAGE —— Android 12 及以下走老通道，maxSdkVersion=32 收口，
+        免得在新系统上申请一个用不上又被审核质疑的权限。
+
+      运行时授权由 app 侧既有的 permission_handler 发起（不新增第三个权限库）。
+      SAF 目录选择本身**不需要**任何存储权限。
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!--
+      Android 11+ 的包可见性：声明「我要找能处理 OPEN_DOCUMENT_TREE 的应用」，
+      让系统 DocumentsUI 对本 app 可见（隐式启动与查询都受这条规则影响）。
+      ⚠️ 只写 action：**不要**在这里加 <category>OPENABLE</category>——
+      规则会拿去和目标应用的 filter 比，DocumentsUI 的树选择 filter 没声明
+      OPENABLE，写了就一条都匹配不上（第一版就栽在这里）。DEFAULT 是隐式的。
+      实测本机（魅族 21 / Android 16）解析到
+      com.android.documentsui/.picker.PickActivity 这一个处理者。
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.OPEN_DOCUMENT_TREE" />
+        </intent>
+    </queries>
+</manifest>

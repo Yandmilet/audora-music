@@ -37,6 +37,13 @@ dependencies:
   # 图片磁盘缓存（歌单封面 / 歌手头像 / 封面墙）
   cached_network_image: ^4.0.4
 
+  # 本地存储能力（SAF 目录选择与持久化授权 / MediaStore 扫描 / 下载落盘）。
+  # 仓库内的 Android 插件，见 plugins/audora_files/——放插件而不是塞
+  # android/app，是因为宿主 Activity 必须是 audio_service 的那个（原因写在
+  # AndroidManifest.xml 注释里），不能为了加一个通道再去动它。
+  audora_files:
+    path: plugins/audora_files
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
