@@ -1,7 +1,7 @@
 name: audora_music
 description: Audora v0.1.0 —— 个人自用音乐播放器（元数据来自 QQ音乐，音源来自 B站）
 publish_to: 'none'
-version: 0.2.0+1
+version: 0.2.0+2
 
 environment:
   sdk: '>=3.13.4 <4.0.0'
