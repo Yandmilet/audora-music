@@ -18,6 +18,8 @@ class Tables {
   static const playLog = 'play_log';
   static const playStat = 'play_stat';
   static const trackVolume = 'track_volume';
+  static const matchSample = 'match_sample';
+  static const localAudio = 'local_audio';
 }
 
 /// ── 表 1：Song（设计文档 3.1）────────────────────────────────
@@ -41,6 +43,7 @@ CREATE TABLE ${Tables.song} (
   duration_ms       INTEGER NOT NULL DEFAULT 0,
   cover_seed        INTEGER NOT NULL DEFAULT 0,
   lyric_offset_ms   INTEGER NOT NULL DEFAULT 0,
+  lyric_slope       REAL    NOT NULL DEFAULT 1.0,
   created_at        INTEGER NOT NULL,
   updated_at        INTEGER NOT NULL,
   UNIQUE (qq_song_mid),
@@ -220,6 +223,59 @@ const List<String> kMigrateV4ToV5 = [
 ];
 
 /// 索引：按「找某首歌的激活音源」「找待匹配的歌」「找失效音源」三种查询建
+/// ── 表 9：LocalAudio（本机音频文件：自带扫描 + app 下载）───────
+///
+/// ## 为什么单独一张表，而不是给 song 加个 local_path 列
+/// 1. **两个列表必须隔开**（产品要求）：「本地」是扫描手机自带歌曲，
+///    「下载」是 app 落盘的文件。混在 song 里就得靠一个布尔列分家，
+///    且清理逻辑会互相误伤——重扫一遍本机不该把下载记录抹掉。
+/// 2. **主键语义不同**：`song` 的一行是「一首歌」（title|artist + QQ mid），
+///    这张表的一行是「一个文件」。同一首歌可能既有手机里的 FLAC 又有
+///    app 下的 MP3，塞进 song 就必须丢掉其中一个。
+/// 3. song 的行靠 `qq_song_mid` upsert，本机文件靠 uri upsert，两套
+///    唯一性放一张表里只会互相打架。
+///
+/// ## 为什么 uri 是唯一键、path 只作展示
+/// MediaStore 的 `content://media/external/audio/media/<id>` 与 SAF 文档 uri
+/// 都能进这一列，且都是系统认可的稳定标识。分区存储（Android 10+）下
+/// `path` 可能读得到路径却打不开文件，所以**播放一律用 uri**。
+///
+/// ## song_id 是这座桥
+/// 下载条目记上它来自曲库的哪首歌，「已下载优先播本地」才能一步查到
+/// （见 `LocalAudioDao.downloadedOfSong`）。扫描条目没有这个对应关系，留 null。
+const String kCreateLocalAudioTable = '''
+CREATE TABLE ${Tables.localAudio} (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind            TEXT    NOT NULL CHECK (kind IN ('local','download')),
+  uri             TEXT    NOT NULL UNIQUE,
+  path            TEXT    NOT NULL DEFAULT '',
+  title           TEXT    NOT NULL,
+  artist          TEXT    NOT NULL DEFAULT '',
+  album           TEXT    NOT NULL DEFAULT '',
+  duration_ms     INTEGER NOT NULL DEFAULT 0,
+  size_bytes      INTEGER NOT NULL DEFAULT 0,
+  -- 文件系统/媒体库时间（秒）。导入工具常写任意值，只当参考。
+  mtime_sec       INTEGER NOT NULL DEFAULT 0,
+  -- 我们第一次 / 最近一次在扫描里见到它。last_seen 用来标「文件已不在」。
+  first_seen      INTEGER NOT NULL,
+  last_seen       INTEGER NOT NULL,
+  -- 下载条目回指曲库的歌；扫描条目为 null。
+  song_id         INTEGER REFERENCES ${Tables.song}(id) ON DELETE SET NULL,
+  -- 下载时用的 B站音质 ID（30280 / 30232 …）；扫描条目为 0。
+  quality_id      INTEGER NOT NULL DEFAULT 0,
+  -- v12：本机文件的「线上门户」。文件本身没有 mid，但按 标题+歌手+时长
+  -- 能去元数据源换回一个真实身份，换到就缓存下来：
+  --   song_mid  → 取歌词（QQ 的 songMid，歌词接口只认它）
+  --   album_mid → 拼封面 URL（派生值，不落 URL 本身，与 song 表同一口径）
+  -- 换不到就是空串，UI 继续走渐变占位。
+  song_mid        TEXT    NOT NULL DEFAULT '',
+  album_mid       TEXT    NOT NULL DEFAULT '',
+  -- 上一次**尝试**补全的时刻（秒），0 = 从没试过。命中与否都会盖这个时刻：
+  -- 没命中的歌下次进页面要不要再打一次请求，靠它做冷却，不靠内存记仇。
+  resolved_at     INTEGER NOT NULL DEFAULT 0
+);
+''';
+
 const List<String> kCreateIndexes = [
   'CREATE INDEX idx_binding_song_active ON ${Tables.binding}(song_id, is_active);',
   'CREATE INDEX idx_binding_confidence ON ${Tables.binding}(confidence);',
@@ -233,6 +289,16 @@ const List<String> kCreateIndexes = [
   'CREATE INDEX idx_playstat_count ON ${Tables.playStat}(play_count DESC);',
 ];
 
+/// v11 新增的索引（跟着 local_audio 一起来）。
+///
+/// 单独一组而不是并到 [kCreateIndexes] 里，是为了让「造一个升级前的 v10 库」
+/// 的测试能精确复刻旧形状——不然它得把历史索引抄一份，而抄的那份一旦
+/// 与这里不同步，迁移测试就是在测一个不存在的库。
+const List<String> kCreateLocalAudioIndexes = [
+  'CREATE INDEX idx_local_kind ON ${Tables.localAudio}(kind, last_seen DESC);',
+  'CREATE INDEX idx_local_song ON ${Tables.localAudio}(song_id);',
+];
+
 /// 全部建表语句（含索引），按依赖顺序排列
 const List<String> kCreateAll = [
   kCreateSongTable,
@@ -242,7 +308,10 @@ const List<String> kCreateAll = [
   kCreatePlayLogTable,
   kCreatePlayStatTable,
   kCreateTrackVolumeTable,
+  kCreateMatchSampleTable, // v9；漏掉会让全新安装静默零采集（只有升级路径有这张表）
+  kCreateLocalAudioTable, // v11；同理——全新装机必须就有这张表
   ...kCreateIndexes,
+  ...kCreateLocalAudioIndexes,
 ];
 
 /// 数据库版本。改动 schema 时必须同步 +1 并提供迁移。
@@ -252,10 +321,13 @@ const List<String> kCreateAll = [
 /// v3 → v4：新增 `track_volume` 表（每曲音量记忆，音效功能 P0）
 /// v4 → v5：新增通用化列（meta_source_type/id、source_type/key/sub_key），
 ///          支持多种元数据源/音源；旧列照常读写（双写模式）
-/// v5 → v6：Song 表新增 `singer_mid` 列（首位歌手 mid，播放页点击进歌手详情）
-/// v6 → v7：Song 表新增 `singer_id` 列（首位歌手数字 ID，fetchSingerAlbums 必需）
 /// v7 → v8：Song 表新增 `lyric_offset_ms` 列（歌词手动校准偏移，方案 D 歌词对齐）
-const int kDbVersion = 8;
+/// v8 → v9：新建 match_sample 表（V0.9 数据闭环 — Golden Dataset）
+/// v9 → v10：Song 表新增 `lyric_slope` 列（两点歌词校准的斜率，默认 1.0）
+/// v10 → v11：新建 local_audio 表（本机音频文件：自带扫描 + app 下载）
+/// v11 → v12：local_audio 加 song_mid / album_mid / resolved_at
+///            （本机文件补全线上身份，用来取真实封面与歌词）
+const int kDbVersion = 12;
 
 /// 迁移脚本：v1 → v2
 ///
@@ -300,6 +372,87 @@ const List<String> kMigrateV6ToV7 = [
 /// 歌词手动校准偏移（毫秒）。默认 0 = 不偏移，由用户在播放页歌词面板微调后写入。
 const List<String> kMigrateV7ToV8 = [
   'ALTER TABLE ${Tables.song} ADD COLUMN lyric_offset_ms INTEGER NOT NULL DEFAULT 0;',
+];
+
+/// ── 表 8：match_sample（V0.9 Golden Dataset）───────────────────────
+///
+/// ## 为什么需要独立表
+/// binding 表只存最终激活结果——它是"结果"而非"过程"。
+/// Golden Dataset 需要存**每次匹配的完整候选打分快照**：
+/// song + all candidates（bvid + title + 各维度分数 + total + confidence）+
+/// 最终决策 + 后续用户反馈（绑定/推翻）。
+///
+/// 这些数据是后续调参的唯一基准——没有它，P0/P1 的改进全凭感觉。
+///
+/// ## 写入时机
+/// MatchEngine.match() 返回后立即写入（非事务、失败静默）。
+/// 后续 library_repository 激活绑定时回填 user_decision。
+const String kCreateMatchSampleTable = '''
+CREATE TABLE ${Tables.matchSample} (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at      INTEGER NOT NULL,
+
+  -- 歌曲快照（匹配时的 Song 字段）
+  song_id         INTEGER NOT NULL,
+  song_title      TEXT    NOT NULL,
+  song_artist     TEXT    NOT NULL,
+  song_album      TEXT    NOT NULL,
+  song_duration   INTEGER NOT NULL,  -- 毫秒
+  song_release    INTEGER,           -- unix ms，可空
+
+  -- 匹配结果
+  best_bvid       TEXT    NOT NULL,
+  best_title      TEXT    NOT NULL,
+  best_total      REAL    NOT NULL,
+  best_confidence TEXT    NOT NULL,    -- AUTO / REVIEW / REJECTED
+  best_detail     TEXT    NOT NULL,    -- JSON: S1~S6 + penalty + contradiction
+
+  -- 候选池快照（JSON 数组）
+  candidates_json TEXT    NOT NULL,    -- [{bvid, title, total, detail, confidence}, ...]
+  margin          REAL    NOT NULL DEFAULT 0.0,  -- best - runnerUp
+
+  -- 用户反馈回填（初始 null）
+  user_decision   TEXT,              -- 'accept' / 'reject' / null(待决策)
+  decision_bvid   TEXT,              -- 用户最终绑定的 bvid（可能 ≠ best_bvid）
+  decided_at      INTEGER,
+  FOREIGN KEY (song_id) REFERENCES ${Tables.song}(id) ON DELETE CASCADE
+);
+'''
+  'CREATE INDEX idx_match_sample_song ON ${Tables.matchSample}(song_id);'
+  'CREATE INDEX idx_match_sample_created ON ${Tables.matchSample}(created_at DESC);';
+
+/// v8 → v9：新建 match_sample 表（V0.9 Golden Dataset）
+const List<String> kMigrateV8ToV9 = [
+  kCreateMatchSampleTable,
+];
+
+/// v9 → v10：加 lyric_slope 列（两点歌词校准的斜率）
+///
+/// 歌词映射 `lrcMs = realMs * slope + offsetMs`：
+/// slope=1.0 是纯平移（片头/片尾/尾奏场景）；用户在两个位置各做一次
+/// 「本句对齐」后算出非 1 斜率，覆盖 UP 主整曲变速场景。
+/// 老数据默认 1.0，与旧的纯偏移校准行为兼容。
+const List<String> kMigrateV9ToV10 = [
+  'ALTER TABLE ${Tables.song} ADD COLUMN lyric_slope REAL NOT NULL DEFAULT 1.0;',
+];
+
+/// v10 → v11：新建 local_audio 表（本机音频文件：自带扫描 + app 下载）
+///
+/// 只加表加索引，不动任何既有数据。老装机用户升上来是一张空表，
+/// 第一次进「本地」点扫描才会有内容——这本来就是新功能，不存在回填。
+const List<String> kMigrateV10ToV11 = [
+  kCreateLocalAudioTable,
+  ...kCreateLocalAudioIndexes,
+];
+
+/// v11 → v12：local_audio 加 `song_mid` / `album_mid` / `resolved_at`
+///
+/// 本机文件要能对上真实封面与歌词，前提是记住「这个文件对应线上哪首歌」。
+/// 三条 ADD COLUMN 都带默认值，旧行升上来就是「没匹配过」，语义天然正确。
+const List<String> kMigrateV11ToV12 = [
+  "ALTER TABLE ${Tables.localAudio} ADD COLUMN song_mid TEXT NOT NULL DEFAULT '';",
+  "ALTER TABLE ${Tables.localAudio} ADD COLUMN album_mid TEXT NOT NULL DEFAULT '';",
+  'ALTER TABLE ${Tables.localAudio} ADD COLUMN resolved_at INTEGER NOT NULL DEFAULT 0;',
 ];
 
 const String kDbName = 'audora.db';

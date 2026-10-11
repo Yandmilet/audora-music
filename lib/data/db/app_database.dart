@@ -10,6 +10,8 @@ import 'package:sqflite/sqflite.dart';
 
 import 'dao/binding_dao.dart';
 import 'dao/liked_dao.dart';
+import 'dao/local_audio_dao.dart';
+import 'dao/match_sample_dao.dart';
 import 'dao/play_stats_dao.dart';
 import 'dao/song_dao.dart';
 import 'dao/video_dao.dart';
@@ -27,6 +29,8 @@ class AppDatabase {
   late final LikedDao liked = LikedDao(db);
   late final PlayStatsDao plays = PlayStatsDao(db);
   late final VolumeDao volumes = VolumeDao(db);
+  late final MatchSampleDao matchSamples = MatchSampleDao(db);
+  late final LocalAudioDao localAudio = LocalAudioDao(db);
 
   static AppDatabase? _instance;
 
@@ -110,6 +114,47 @@ class AppDatabase {
             }
           }
         }
+        if (oldV < 9) {
+          for (final sql in kMigrateV8ToV9) {
+            try {
+              await db.execute(sql);
+            } catch (e) {
+              // v8→v9 可能是新表（测试造"v9 旧库"时已含该表）
+              if (!e.toString().contains('already exists')) rethrow;
+            }
+          }
+        }
+        if (oldV < 10) {
+          for (final sql in kMigrateV9ToV10) {
+            try {
+              await db.execute(sql);
+            } catch (e) {
+              if (!e.toString().contains('duplicate column name')) rethrow;
+            }
+          }
+        }
+        if (oldV < 11) {
+          // 新表 + 新索引：重复执行只会是「已存在」，容错一下，
+          // 免得半途中断过的库每次启动都卡在这条迁移上。
+          for (final sql in kMigrateV10ToV11) {
+            try {
+              await db.execute(sql);
+            } catch (e) {
+              final s = e.toString();
+              if (!s.contains('already exists')) rethrow;
+            }
+          }
+        }
+        if (oldV < 12) {
+          // v11→v12：local_audio 三条 ADD COLUMN（本机文件的线上身份缓存）。
+          for (final sql in kMigrateV11ToV12) {
+            try {
+              await db.execute(sql);
+            } catch (e) {
+              if (!e.toString().contains('duplicate column name')) rethrow;
+            }
+          }
+        }
       },
     );
 
@@ -131,6 +176,7 @@ class AppDatabase {
       await txn.delete(Tables.playStat);
       await txn.delete(Tables.trackVolume);
       await txn.delete(Tables.liked);
+      await txn.delete(Tables.matchSample);
       await txn.delete(Tables.binding);
       await txn.delete(Tables.video);
       await txn.delete(Tables.song);

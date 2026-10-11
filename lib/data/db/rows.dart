@@ -45,6 +45,10 @@ class SongRow {
   final int durationMs;
   final int coverSeed;
   final int lyricOffsetMs;
+
+  /// 歌词映射斜率：`lrcMs = realMs * lyricSlope + lyricOffsetMs`。
+  /// 1.0 = 纯平移；两点校准后可能非 1（UP 主整曲变速）。
+  final double lyricSlope;
   final int createdAt;
   final int updatedAt;
 
@@ -67,6 +71,7 @@ class SongRow {
     this.durationMs = 0,
     this.coverSeed = 0,
     this.lyricOffsetMs = 0,
+    this.lyricSlope = 1.0,
     required this.createdAt,
     required this.updatedAt,
   });
@@ -92,6 +97,7 @@ class SongRow {
         'duration_ms': durationMs,
         'cover_seed': coverSeed,
         'lyric_offset_ms': lyricOffsetMs,
+        'lyric_slope': lyricSlope,
         'created_at': createdAt,
         'updated_at': updatedAt,
       };
@@ -120,6 +126,8 @@ class SongRow {
       durationMs: m['duration_ms'] as int? ?? 0,
       coverSeed: m['cover_seed'] as int? ?? 0,
       lyricOffsetMs: m['lyric_offset_ms'] as int? ?? 0,
+      // REAL 列读回为 double；as num? 兜底个别平台把 1.0 返成 int 的情况
+      lyricSlope: (m['lyric_slope'] as num?)?.toDouble() ?? 1.0,
       createdAt: m['created_at'] as int? ?? 0,
       updatedAt: m['updated_at'] as int? ?? 0,
     );
@@ -164,6 +172,7 @@ class SongRow {
       durationMs: song.duration * 1000,
       coverSeed: song.coverSeed,
       lyricOffsetMs: song.lyricOffsetMs,
+      lyricSlope: song.lyricSlope,
       createdAt: createdAt ?? ts,
       updatedAt: ts,
     );
@@ -197,6 +206,7 @@ class SongRow {
       singerMid: singerMid.isEmpty ? null : singerMid,
       singerId: singerId,
       lyricOffsetMs: lyricOffsetMs,
+      lyricSlope: lyricSlope,
     );
   }
 

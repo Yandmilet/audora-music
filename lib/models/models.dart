@@ -208,9 +208,17 @@ class Song {
   /// **存储粒度**：per-song 而非 per-source。同一首歌的不同音源偏移可能不同，
   /// 但 90% 场景下换音源只需重新校准一次，换来 schema 大幅简化。
   ///
-  /// **生效位置**：AppState.mappedLyricMs() 把播放器真实位置 × 比例因子
-  /// 后加上这个值，映射到 LRC 时间空间再做行查找。
+  /// **生效位置**：歌词映射为
+  /// `lrcMs = realMs * [lyricSlope] + lyricOffsetMs`，
+  /// 见 AppState.mappedLyricMs。
   final int lyricOffsetMs;
+
+  /// 歌词校准斜率（LRC 时长 ÷ 真实音频时长）。
+  ///
+  /// 1.0 = 纯平移（片头/片尾/尾奏造成的错位）；非 1 表示用户用
+  /// 「本句对齐」做过两点校准，覆盖 UP 主整曲加速/减速的音源。
+  /// 由两个 (realMs, lrcMs) 锚点线性拟合得出。
+  final double lyricSlope;
 
   const Song({
     this.id,
@@ -232,6 +240,7 @@ class Song {
     this.singerMid,
     this.singerId,
     this.lyricOffsetMs = 0,
+    this.lyricSlope = 1.0,
   });
 
   /// 唯一键：歌名 + 歌手（用于同名异曲消歧）
@@ -257,6 +266,7 @@ class Song {
     String? singerMid,
     int? singerId,
     int? lyricOffsetMs,
+    double? lyricSlope,
   }) {
     return Song(
       id: id ?? this.id,
@@ -278,6 +288,7 @@ class Song {
       singerMid: singerMid ?? this.singerMid,
       singerId: singerId ?? this.singerId,
       lyricOffsetMs: lyricOffsetMs ?? this.lyricOffsetMs,
+      lyricSlope: lyricSlope ?? this.lyricSlope,
     );
   }
 
